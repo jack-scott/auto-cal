@@ -2,8 +2,9 @@
 Convert Caliterra EXIF drone images → input.mcap for Foxglove.
 
 Topics written:
-  /camera/image   foxglove.CompressedImage   JPEG at native 4000×3000
-  /gps/fix        foxglove.LocationFix       lat/lon/alt from EXIF GPS
+  /camera/image         foxglove.CompressedImage   JPEG at native resolution
+  /camera/calibration   foxglove.CameraCalibration estimated from EXIF focal length
+  /gps/fix              foxglove.LocationFix        lat/lon/alt from EXIF GPS
 
 Timestamps come from the GPS UTC date+time embedded in each image.
 """
@@ -11,19 +12,23 @@ Timestamps come from the GPS UTC date+time embedded in each image.
 from datetime import datetime, timezone
 from pathlib import Path
 
-import foxglove
 import piexif
+from foxglove_schemas_protobuf.CameraCalibration_pb2 import CameraCalibration
 from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 from foxglove_schemas_protobuf.LocationFix_pb2 import LocationFix
-from google.protobuf import descriptor_pb2
-from google.protobuf.timestamp_pb2 import Timestamp
+
+from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
+from autocal.optics.camera import fx_from_exif
 
 DATA_DIR = Path(__file__).parent.parent / "data" / "caliterra"
 OUTPUT = Path(__file__).parent.parent / "data" / "input.mcap"
 
+# Canon SX260 HS: 1/2.3-inch CCD sensor, 6.17mm × 4.55mm
+SENSOR_WIDTH_MM = 6.17
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# EXIF helpers
 # ---------------------------------------------------------------------------
 
 def _rational(v) -> float:
@@ -47,32 +52,33 @@ def _gps_to_unix_ns(date_stamp: bytes, time_stamp) -> int:
     return int(dt.timestamp() * 1_000_000_000)
 
 
-def _proto_schema(msg_class) -> foxglove.Schema:
-    desc = msg_class.DESCRIPTOR
-    fds = descriptor_pb2.FileDescriptorSet()
-    seen: set = set()
+def _build_calibration(exif: dict, t_ns: int, width: int, height: int) -> CameraCalibration:
+    """Build a CameraCalibration proto from EXIF focal length."""
+    focal_mm = None
+    exif_img = exif.get("Exif", {})
+    raw_focal = exif_img.get(piexif.ExifIFD.FocalLength)
+    if raw_focal:
+        focal_mm = _rational(raw_focal)
 
-    def _collect(fd):
-        if fd.name in seen:
-            return
-        seen.add(fd.name)
-        for dep in fd.dependencies:
-            _collect(dep)
-        fd.CopyToProto(fds.file.add())
+    if focal_mm and focal_mm > 0:
+        fx = fx_from_exif(focal_mm, SENSOR_WIDTH_MM, width)
+    else:
+        fx = max(width, height) * 1.2  # rough fallback
 
-    _collect(desc.file)
-    return foxglove.Schema(
-        name=desc.full_name,
-        encoding="protobuf",
-        data=fds.SerializeToString(),
-    )
+    cx = width / 2.0
+    cy = height / 2.0
 
-
-def _ns_to_ts(ns: int) -> Timestamp:
-    ts = Timestamp()
-    ts.seconds = ns // 1_000_000_000
-    ts.nanos = ns % 1_000_000_000
-    return ts
+    cc = CameraCalibration()
+    cc.timestamp.CopyFrom(ns_to_timestamp(t_ns))
+    cc.frame_id = "camera_link"
+    cc.width = width
+    cc.height = height
+    cc.distortion_model = "plumb_bob"
+    cc.D.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+    cc.K.extend([fx, 0.0, cx, 0.0, fx, cy, 0.0, 0.0, 1.0])
+    cc.R.extend([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    cc.P.extend([fx, 0.0, cx, 0.0, 0.0, fx, cy, 0.0, 0.0, 0.0, 1.0, 0.0])
+    return cc
 
 
 # ---------------------------------------------------------------------------
@@ -87,17 +93,8 @@ def main() -> None:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     print(f"Converting {len(jpgs)} images → {OUTPUT}")
 
-    with foxglove.open_mcap(str(OUTPUT), allow_overwrite=True):
-        img_ch = foxglove.Channel(
-            "/camera/image",
-            schema=_proto_schema(CompressedImage),
-            message_encoding="protobuf",
-        )
-        gps_ch = foxglove.Channel(
-            "/gps/fix",
-            schema=_proto_schema(LocationFix),
-            message_encoding="protobuf",
-        )
+    with McapWriter(OUTPUT) as writer:
+        cal_written = False
 
         for i, path in enumerate(jpgs):
             exif = piexif.load(str(path))
@@ -109,7 +106,6 @@ def main() -> None:
             if date_stamp and time_stamp:
                 t_ns = _gps_to_unix_ns(date_stamp, time_stamp)
             else:
-                # Fallback: 1-second increments from epoch if no GPS time
                 t_ns = i * 1_000_000_000
 
             lat = _dms_to_deg(
@@ -122,22 +118,33 @@ def main() -> None:
             )
             alt = _rational(gps[piexif.GPSIFD.GPSAltitude])
 
+            # Image dimensions from EXIF
+            exif_img = exif.get("Exif", {})
+            width = exif_img.get(piexif.ExifIFD.PixelXDimension, 640)
+            height = exif_img.get(piexif.ExifIFD.PixelYDimension, 480)
+
+            # Write calibration once (first image)
+            if not cal_written:
+                cc = _build_calibration(exif, t_ns, width, height)
+                writer.write("/camera/calibration", cc, t_ns)
+                cal_written = True
+
             # CompressedImage
             img_msg = CompressedImage()
-            img_msg.timestamp.CopyFrom(_ns_to_ts(t_ns))
+            img_msg.timestamp.CopyFrom(ns_to_timestamp(t_ns))
             img_msg.frame_id = "camera_link"
             img_msg.format = "jpeg"
             img_msg.data = path.read_bytes()
-            img_ch.log(img_msg.SerializeToString(), log_time=t_ns)
+            writer.write("/camera/image", img_msg, t_ns)
 
             # LocationFix
             fix_msg = LocationFix()
-            fix_msg.timestamp.CopyFrom(_ns_to_ts(t_ns))
+            fix_msg.timestamp.CopyFrom(ns_to_timestamp(t_ns))
             fix_msg.frame_id = "camera_link"
             fix_msg.latitude = lat
             fix_msg.longitude = lon
             fix_msg.altitude = alt
-            gps_ch.log(fix_msg.SerializeToString(), log_time=t_ns)
+            writer.write("/gps/fix", fix_msg, t_ns)
 
             print(f"\r  {i+1}/{len(jpgs)}  {path.name}", end="", flush=True)
 
