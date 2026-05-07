@@ -1,0 +1,21 @@
+[workspace]
+name = "auto-cal"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.11"
+gtsam = "==4.2.1"
+opencv = ">=4.8"
+numpy = ">=1.24"
+
+[pypi-dependencies]
+piexif = ">=1.1"
+foxglove-sdk = ">=0.22"
+foxglove-schemas-protobuf = ">=0.1"
+mcap-protobuf-support = ">=0.5"
+
+[tasks]
+download-data = { cmd = ["python", "tools/download_dataset.py"] }
+convert = { cmd = ["python", "tools/convert_to_mcap.py"], depends-on = ["download-data"] }
+self-cal = { cmd = ["python", "tools/self_calibration.py"], depends-on = ["convert"] }
