@@ -20,10 +20,34 @@ foxglove-schemas-protobuf = ">=0.1"
 mcap-protobuf-support = ">=0.5"
 autocal = { path = ".", editable = true }
 
-[tasks]
-download-data = { cmd = ["python", "tools/download_dataset.py"] }
-convert       = { cmd = ["python", "tools/convert_to_mcap.py"],  depends-on = ["download-data"] }
-self-cal      = { cmd = ["python", "tools/run_calibration.py",
-                          "data/input.mcap",
-                          "data/reconstruction.mcap"], depends-on = ["convert"] }
-test          = { cmd = ["pytest", "tests/", "-v"] }
+# --- Caliterra (ODM UAV nadir survey, Canon SX260 HS + GPS) -----------------
+
+[tasks.caliterra-download]
+cmd = ["python", "tools/download_dataset.py"]
+
+[tasks.caliterra-convert]
+cmd = ["python", "tools/convert_to_mcap.py"]
+depends-on = ["caliterra-download"]
+
+[tasks.caliterra-calibrate]
+cmd = ["python", "tools/run_calibration.py",
+       "data/caliterra.mcap",
+       "data/caliterra_calibrated.mcap",
+       "--nadir"]
+depends-on = ["caliterra-convert"]
+
+# --- ETH3D pipes (indoor DSLR, COLMAP PINHOLE intrinsics, no GPS) -----------
+
+[tasks.pipes-download]
+cmd = ["python", "tools/download_eth3d_pipes.py"]
+
+[tasks.pipes-calibrate]
+cmd = ["python", "tools/run_calibration.py",
+       "data/eth3d_pipes.mcap",
+       "data/eth3d_pipes_calibrated.mcap"]
+depends-on = ["pipes-download"]
+
+# --- Misc -------------------------------------------------------------------
+
+[tasks.test]
+cmd = ["pytest", "tests/", "-v"]

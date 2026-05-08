@@ -78,6 +78,7 @@ from autocal.gtsam_bridge.conversions import (
 )
 from autocal.io.mcap_reader import get_topic_map, iter_messages
 from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
+from autocal.engine.visualization import write_camera_path
 from autocal.optics.camera import overlay_keypoints
 
 
@@ -303,12 +304,18 @@ class CalibrationEngine:
         # Add initial calibration
         initial_values.insert(L(0), cal)
 
-        # Pose priors from GPS
-        pose_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
-            opts.pose_noise_rad, opts.pose_noise_rad, opts.pose_noise_rad,
-            opts.pose_noise_m,   opts.pose_noise_m,   opts.pose_noise_m,
-        ]))
+        # Pose priors — noise derived from GPS covariance if present in the
+        # LocationFix message (DIAGONAL_KNOWN / KNOWN), otherwise fallback to
+        # opts.pose_noise_m.  When no GPS data exists at all the translation
+        # sigma is set to a very large value so the prior is effectively non-
+        # binding and the reprojection factors alone determine camera positions.
         for t_ns, pose in initial_poses.items():
+            gps_msg = _nearest_gps(gps_fixes, t_ns) if gps_fixes else None
+            t_sigs = _translation_sigmas_from_gps(gps_msg, opts.pose_noise_m)
+            pose_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
+                opts.pose_noise_rad, opts.pose_noise_rad, opts.pose_noise_rad,
+                *t_sigs,
+            ]))
             graph.add(gtsam.PriorFactorPose3(X(id_to_idx[t_ns]), pose, pose_noise))
 
         # Calibration prior (weak — let it move)
@@ -363,15 +370,14 @@ class CalibrationEngine:
             w, h = _jpeg_dimensions(bytes(first_img.data))
 
         with McapWriter(output_path) as writer:
-            # Calibration (one message at first image timestamp)
             t0_ns = img_ids[0]
-            cc = camera_calibration_from_cal3bundler(opt_cal, "camera_link", t0_ns, w, h)
-            writer.write(CAMERA_CAL_TOPIC, cc, t0_ns)
 
-            # Camera poses as TF messages
+            cc = camera_calibration_from_cal3bundler(opt_cal, "camera_link", t0_ns, w, h)
+            writer.write("/calibrated/camera/calibration", cc, t0_ns)
+
             for t_ns, pose in opt_poses.items():
                 ft = frame_transform_from_pose3(pose, "map", "camera_link", t_ns)
-                writer.write("/tf", ft, t_ns)
+                writer.write("/calibrated/tf", ft, t_ns)
 
             # SIFT overlay images
             for t_ns, img_msg in images:
@@ -382,13 +388,30 @@ class CalibrationEngine:
                 overlay_msg.frame_id = "camera_link"
                 overlay_msg.format = "jpeg"
                 overlay_msg.data = overlay_bytes
-                writer.write("/camera/sift_overlay", overlay_msg, t_ns)
+                writer.write("/calibrated/camera/sift_overlay", overlay_msg, t_ns)
 
-            # Point cloud
             if len(triangulated) > 0:
                 pts = np.array([t.point3d for t in triangulated], dtype=np.float32)
                 pc_msg = _make_point_cloud(pts, t0_ns, "map")
-                writer.write("/points/sfm", pc_msg, t0_ns)
+                writer.write("/calibrated/points/sfm", pc_msg, t0_ns)
+
+            # ---------------------------------------------------------- #
+            # 3D scene visualisation  (/scene/*)
+            # ---------------------------------------------------------- #
+
+            if len(initial_poses) > 0:
+                write_camera_path(
+                    writer, initial_poses,
+                    topic="/scene/cameras/initial",
+                    r=0.5, g=0.7, b=1.0,
+                    cal=cal,
+                )
+            write_camera_path(
+                writer, opt_poses,
+                topic="/scene/cameras/optimized",
+                r=0.2, g=1.0, b=0.3,
+                cal=opt_cal,
+            )
 
         return {
             "calibration": opt_cal,
@@ -436,6 +459,34 @@ def _all_positive_depth(
         if z <= 0:
             return False
     return True
+
+
+_NO_GPS_SIGMA_M = 100.0  # effectively unconstrained when no GPS data
+
+
+def _translation_sigmas_from_gps(
+    fix: LocationFix | None,
+    fallback_m: float,
+) -> tuple[float, float, float]:
+    """Return (σ_E, σ_N, σ_U) in metres for use as a pose prior.
+
+    Reads the diagonal ENU covariance from the LocationFix if the type is
+    DIAGONAL_KNOWN or KNOWN.  Falls back to fallback_m for all axes if the
+    covariance type is UNKNOWN / APPROXIMATED, or to _NO_GPS_SIGMA_M if the
+    fix itself is None (no GPS in the dataset).
+    """
+    if fix is None:
+        return _NO_GPS_SIGMA_M, _NO_GPS_SIGMA_M, _NO_GPS_SIGMA_M
+    cov_type = fix.position_covariance_type
+    if cov_type in (LocationFix.DIAGONAL_KNOWN, LocationFix.KNOWN):
+        cov = list(fix.position_covariance)
+        if len(cov) >= 9:
+            return (
+                math.sqrt(max(cov[0], 1e-6)),
+                math.sqrt(max(cov[4], 1e-6)),
+                math.sqrt(max(cov[8], 1e-6)),
+            )
+    return fallback_m, fallback_m, fallback_m
 
 
 def _nearest_gps(

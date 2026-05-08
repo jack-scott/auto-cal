@@ -21,7 +21,7 @@ from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
 from autocal.optics.camera import fx_from_exif
 
 DATA_DIR = Path(__file__).parent.parent / "data" / "caliterra"
-OUTPUT = Path(__file__).parent.parent / "data" / "input.mcap"
+OUTPUT = Path(__file__).parent.parent / "data" / "caliterra.mcap"
 
 # Canon SX260 HS: 1/2.3-inch CCD sensor, 6.17mm × 4.55mm
 SENSOR_WIDTH_MM = 6.17
@@ -85,6 +85,11 @@ def _build_calibration(exif: dict, t_ns: int, width: int, height: int) -> Camera
 # Main
 # ---------------------------------------------------------------------------
 
+# Canon SX260 HS consumer GPS accuracy (1-sigma, metres)
+_GPS_SIGMA_HORIZONTAL_M = 3.0
+_GPS_SIGMA_VERTICAL_M   = 5.0
+
+
 def main() -> None:
     jpgs = sorted(DATA_DIR.glob("*.jpg"))
     if not jpgs:
@@ -93,6 +98,8 @@ def main() -> None:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     print(f"Converting {len(jpgs)} images → {OUTPUT}")
 
+    seen_timestamps: set[int] = set()
+
     with McapWriter(OUTPUT) as writer:
         cal_written = False
 
@@ -100,13 +107,16 @@ def main() -> None:
             exif = piexif.load(str(path))
             gps = exif.get("GPS", {})
 
-            # Timestamp from GPS UTC
+            # Timestamp from GPS UTC; deduplicate by advancing 1 ms if needed
             date_stamp = gps.get(piexif.GPSIFD.GPSDateStamp)
             time_stamp = gps.get(piexif.GPSIFD.GPSTimeStamp)
             if date_stamp and time_stamp:
                 t_ns = _gps_to_unix_ns(date_stamp, time_stamp)
             else:
                 t_ns = i * 1_000_000_000
+            while t_ns in seen_timestamps:
+                t_ns += 1_000_000  # advance 1 ms
+            seen_timestamps.add(t_ns)
 
             lat = _dms_to_deg(
                 gps[piexif.GPSIFD.GPSLatitude],
@@ -137,13 +147,19 @@ def main() -> None:
             img_msg.data = path.read_bytes()
             writer.write("/camera/image", img_msg, t_ns)
 
-            # LocationFix
+            # LocationFix — include diagonal position covariance so the
+            # calibration engine knows how tightly to constrain these poses.
+            # Row-major ENU covariance [σ_E², 0, 0, 0, σ_N², 0, 0, 0, σ_U²]
+            sh2 = _GPS_SIGMA_HORIZONTAL_M ** 2
+            sv2 = _GPS_SIGMA_VERTICAL_M ** 2
             fix_msg = LocationFix()
             fix_msg.timestamp.CopyFrom(ns_to_timestamp(t_ns))
             fix_msg.frame_id = "camera_link"
             fix_msg.latitude = lat
             fix_msg.longitude = lon
             fix_msg.altitude = alt
+            fix_msg.position_covariance[:] = [sh2, 0, 0,  0, sh2, 0,  0, 0, sv2]
+            fix_msg.position_covariance_type = LocationFix.DIAGONAL_KNOWN
             writer.write("/gps/fix", fix_msg, t_ns)
 
             print(f"\r  {i+1}/{len(jpgs)}  {path.name}", end="", flush=True)
