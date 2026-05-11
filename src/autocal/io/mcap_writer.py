@@ -123,3 +123,34 @@ class McapWriter:
                 message_encoding="protobuf",
             )
         self._channels[topic].log(msg.SerializeToString(), log_time=t_ns)
+
+    def write_json(self, topic: str, fields: dict[str, str], msg: dict, t_ns: int) -> None:
+        """Write a JSON-encoded message — use for numeric values Foxglove can plot.
+
+        The channel is registered once using a minimal JSON Schema built from
+        *fields*, then each call serialises *msg* as JSON bytes.
+
+        Args:
+            topic:  MCAP topic string.
+            fields: {field_name: json_schema_type} for schema registration,
+                    e.g. {"position_error_m": "number"}.  Only used on the
+                    first call per topic.
+            msg:    Message data as a plain dict.
+            t_ns:   Log timestamp in Unix nanoseconds.
+        """
+        import json
+        if topic not in self._channels:
+            schema_doc = {
+                "type": "object",
+                "properties": {k: {"type": v} for k, v in fields.items()},
+            }
+            self._channels[topic] = foxglove.Channel(
+                topic,
+                schema=foxglove.Schema(
+                    name=topic.lstrip("/").replace("/", "_"),
+                    encoding="jsonschema",
+                    data=json.dumps(schema_doc).encode(),
+                ),
+                message_encoding="json",
+            )
+        self._channels[topic].log(json.dumps(msg).encode(), log_time=t_ns)

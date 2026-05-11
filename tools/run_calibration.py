@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--lm-iterations", type=int, default=50)
     parser.add_argument("--pose-noise-m", type=float, default=2.0)
     parser.add_argument("--cal-noise-frac", type=float, default=0.3)
+    parser.add_argument("--cal-cx-noise-frac", type=float, default=0.01)
     parser.add_argument("--pixel-noise-px", type=float, default=2.0)
     parser.add_argument("--nadir", action="store_true",
                         help="Initialise cameras looking straight down (UAV nadir survey)")
@@ -57,6 +58,7 @@ def main() -> None:
         lm_iterations=args.lm_iterations,
         pose_noise_m=args.pose_noise_m,
         cal_noise_frac=args.cal_noise_frac,
+        cal_cx_noise_frac=args.cal_cx_noise_frac,
         pixel_noise_px=args.pixel_noise_px,
         nadir_camera=args.nadir,
         max_tracks=args.max_tracks,
@@ -73,13 +75,17 @@ def main() -> None:
     elapsed = time.time() - t_start
 
     cal = result["calibration"]
+    k = cal.k()
     print(f"Calibration complete in {elapsed:.1f}s")
     print(f"  Tracks triangulated: {result['n_tracks']}")
     print(f"  fx  = {cal.fx():.2f} px")
+    print(f"  fy  = {cal.fy():.2f} px")
     print(f"  cx  = {cal.px():.2f} px")
     print(f"  cy  = {cal.py():.2f} px")
-    print(f"  k1  = {cal.k1():.6f}")
-    print(f"  k2  = {cal.k2():.6f}")
+    print(f"  k1  = {k[0]:.6f}")
+    print(f"  k2  = {k[1]:.6f}")
+    print(f"  p1  = {k[2]:.6f}")
+    print(f"  p2  = {k[3]:.6f}")
     print(f"\nResults written to: {args.output}")
 
 

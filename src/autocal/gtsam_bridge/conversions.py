@@ -104,6 +104,79 @@ def frame_transform_from_pose3(
     return ft
 
 
+def cal3ds2_from_camera_calibration(cc: CameraCalibration) -> gtsam.Cal3DS2:
+    """Extract a Cal3DS2 from a CameraCalibration proto.
+
+    Args:
+        cc: CameraCalibration with distortion_model="plumb_bob",
+            K (9 elements row-major), D (at least 2 elements).
+
+    Returns:
+        gtsam.Cal3DS2(fx, fy, skew, cx, cy, k1, k2, p1, p2).
+
+    Raises:
+        ValueError: If distortion_model is not "plumb_bob" or K is missing.
+    """
+    if cc.distortion_model and cc.distortion_model != "plumb_bob":
+        raise ValueError(
+            f"Unsupported distortion model {cc.distortion_model!r}; "
+            "only 'plumb_bob' is supported"
+        )
+    if len(cc.K) < 9:
+        raise ValueError(f"CameraCalibration.K must have 9 elements, got {len(cc.K)}")
+
+    fx   = cc.K[0]
+    fy   = cc.K[4]
+    skew = cc.K[1]
+    cx   = cc.K[2]
+    cy   = cc.K[5]
+    d    = list(cc.D)
+    k1   = d[0] if len(d) > 0 else 0.0
+    k2   = d[1] if len(d) > 1 else 0.0
+    p1   = d[2] if len(d) > 2 else 0.0
+    p2   = d[3] if len(d) > 3 else 0.0
+    return gtsam.Cal3DS2(fx, fy, skew, cx, cy, k1, k2, p1, p2)
+
+
+def camera_calibration_from_cal3ds2(
+    cal: gtsam.Cal3DS2,
+    frame_id: str,
+    t_ns: int,
+    width: int,
+    height: int,
+) -> CameraCalibration:
+    """Build a CameraCalibration proto from a Cal3DS2.
+
+    Args:
+        cal:      GTSAM Cal3DS2 (fx, fy, skew, cx, cy, k1, k2, p1, p2).
+        frame_id: e.g. "camera_link"
+        t_ns:     Timestamp in Unix nanoseconds.
+        width:    Image width in pixels.
+        height:   Image height in pixels.
+
+    Returns:
+        CameraCalibration with plumb_bob distortion, K, R (identity), P filled.
+    """
+    fx   = cal.fx()
+    fy   = cal.fy()
+    cx   = cal.px()
+    cy   = cal.py()
+    k    = cal.k()   # [k1, k2, p1, p2]
+    k1, k2, p1, p2 = float(k[0]), float(k[1]), float(k[2]), float(k[3])
+
+    cc = CameraCalibration()
+    cc.timestamp.CopyFrom(ns_to_timestamp(t_ns))
+    cc.frame_id = frame_id
+    cc.width = width
+    cc.height = height
+    cc.distortion_model = "plumb_bob"
+    cc.D.extend([k1, k2, p1, p2, 0.0])         # k3 = 0
+    cc.K.extend([fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0])
+    cc.R.extend([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    cc.P.extend([fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0])
+    return cc
+
+
 def cal3bundler_from_camera_calibration(cc: CameraCalibration) -> gtsam.Cal3Bundler:
     """Extract a Cal3Bundler from a CameraCalibration proto.
 
