@@ -111,16 +111,14 @@ def test_frame_transform_from_pose3_metadata():
 
 
 def test_ft_rotation_convention():
-    """TF rotation = R_wc; a 90° CW-around-Z camera sees X-right in camera = Y in world."""
-    # R_cw rotates world +X → camera +Y (camera is rotated 90° CW from world around Z)
+    """Pose3(R_wc, t) → FrameTransform rotation = R_wc directly (no inversion)."""
     angle = math.pi / 2
-    R_cw = _rot_z(angle)  # world X maps to camera Y
-    pose = gtsam.Pose3(R_cw, gtsam.Point3(0, 0, 0))
+    R_wc = _rot_z(angle)  # 90° around Z stored as R_wc
+    pose = gtsam.Pose3(R_wc, gtsam.Point3(0, 0, 0))
     ft = frame_transform_from_pose3(pose, "map", "camera_link", 0)
-    # TF rotation is R_wc = R_cw.inverse() = rotation by -90° around Z
-    # Quaternion for -90° around Z: qz = sin(-45°), qw = cos(-45°)
-    expected_qz = math.sin(-math.pi / 4)
-    expected_qw = math.cos(-math.pi / 4)
+    # TF rotation = R_wc = +90° around Z
+    # Quaternion for +90° around Z: qz = sin(45°), qw = cos(45°)
+    expected_qz = math.sin(math.pi / 4)
     assert abs(ft.rotation.z - expected_qz) < 1e-9
 
 

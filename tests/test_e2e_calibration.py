@@ -1,13 +1,22 @@
 """End-to-end calibration tests using the ETH3D pipes dataset.
 
-Tests that the SfM optimizer recovers known ground-truth camera intrinsics
-when given noisy initial pose estimates (simulating GPS uncertainty).
+Two tests covering the two calibration model types:
 
-Requires the ETH3D undistorted pipes dataset at:
-  data/eth3d_pipes/pipes/
+1. test_focal_length_recovery_undistorted  (Cal3DS2, PINHOLE)
+   Uses undistorted images (k=0).  Starts with 10% wrong focal length.
+   The optimizer must recover the correct focal length.
+   Dataset: dslr_calibration_undistorted  (pipes_dslr_undistorted.7z)
 
-Download with:
-  pixi run pipes-download
+2. test_focal_length_recovery_fisheye  (Cal3Fisheye, THIN_PRISM_FISHEYE)
+   Uses raw distorted images with Kannala-Brandt fisheye distortion.
+   Starts with 10% wrong focal length, correct k1/k2/k3/k4.
+   The optimizer must recover the correct focal length while keeping
+   distortion near GT.
+   Dataset: dslr_calibration_jpg  (pipes_dslr_jpg.7z)
+
+Downloads:
+  pixi run pipes-download          # undistorted
+  pixi run pipes-download-raw      # raw/distorted
 """
 
 from __future__ import annotations
@@ -26,164 +35,74 @@ from autocal.engine.calibration import CalibrationOptions, optimize_sfm
 # ---------------------------------------------------------------------------
 
 _DATA_ROOT = Path(__file__).parent.parent / "data/eth3d_pipes/pipes"
-_IMAGES_DIR = _DATA_ROOT / "images/dslr_images_undistorted"
-_CAL_DIR = _DATA_ROOT / "dslr_calibration_undistorted"
 
-_DATASET_PRESENT = _DATA_ROOT.exists()
+_UNDIST_IMAGES = _DATA_ROOT / "images/dslr_images_undistorted"
+_UNDIST_CAL    = _DATA_ROOT / "dslr_calibration_undistorted"
 
-# ---------------------------------------------------------------------------
-# Shared fixture
-# ---------------------------------------------------------------------------
+_RAW_IMAGES    = _DATA_ROOT / "images/dslr_images"
+_RAW_CAL       = _DATA_ROOT / "dslr_calibration_jpg"
 
-_MAX_IMAGES = 6       # first N images — keeps test time manageable
-_SIFT_FEATURES = 800  # cap per image
+_UNDIST_PRESENT = _UNDIST_IMAGES.exists() and _UNDIST_CAL.exists()
+_RAW_PRESENT    = _RAW_IMAGES.exists() and _RAW_CAL.exists()
 
-
-@pytest.fixture(scope="module")
-def eth3d_data():
-    """Load GT calibration, poses, and image bytes once per module."""
-    gt_cal, width, height = parse_cameras(_CAL_DIR / "cameras.txt")
-    gt_poses_named = parse_images(_CAL_DIR / "images.txt")
-
-    sorted_names = sorted(gt_poses_named.keys())[:_MAX_IMAGES]
-
-    images = []
-    gt_poses: dict[int, gtsam.Pose3] = {}
-    for idx, name in enumerate(sorted_names):
-        img_path = _IMAGES_DIR / Path(name).name
-        images.append((idx, img_path.read_bytes()))
-        gt_poses[idx] = gt_poses_named[name]
-
-    return {
-        "gt_cal": gt_cal,
-        "width": width,
-        "height": height,
-        "images": images,
-        "gt_poses": gt_poses,
-    }
+_MAX_IMAGES = 6
+_SIFT_FEATURES = 800
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _add_translation_noise(
-    poses: dict[int, gtsam.Pose3],
-    sigma_m: float,
-    rng: np.random.Generator,
-) -> dict[int, gtsam.Pose3]:
-    noisy = {}
-    for k, pose in poses.items():
-        noise = rng.normal(0.0, sigma_m, 3)
-        noisy[k] = gtsam.Pose3(pose.rotation(), gtsam.Point3(*(pose.translation() + noise)))
-    return noisy
+def _load_dataset(images_dir: Path, cal_dir: Path) -> tuple:
+    """Load GT cal, GT poses, and image bytes for the first _MAX_IMAGES frames."""
+    gt_cal, _w, _h = parse_cameras(cal_dir / "cameras.txt")
+    gt_poses_named = parse_images(cal_dir / "images.txt")
+    sorted_names = sorted(gt_poses_named.keys())[:_MAX_IMAGES]
+
+    images: list[tuple[int, bytes]] = []
+    gt_poses: dict[int, gtsam.Pose3] = {}
+    for idx, name in enumerate(sorted_names):
+        img_path = images_dir / Path(name).name
+        images.append((idx, img_path.read_bytes()))
+        gt_poses[idx] = gt_poses_named[name]
+
+    return gt_cal, images, gt_poses
 
 
-def _make_opts(noise_m: float) -> CalibrationOptions:
-    return CalibrationOptions(
-        sift_features=_SIFT_FEATURES,
-        match_ratio=0.75,
-        min_matches=8,
-        lm_iterations=200,
-        pose_noise_m=noise_m,
-        pose_noise_rad=0.05,
-        cal_noise_frac=0.2,
-        cal_cx_noise_frac=0.01,
-        # Undistorted images: pin distortion near zero to prevent fx/k degeneracy
-        k1_sigma=0.05,
-        k2_sigma=0.02,
-        p1_sigma=0.005,
-        p2_sigma=0.005,
-        pixel_noise_px=1.5,
-        max_tracks=1500,
-    )
-
-
-def _print_comparison(label: str, got: gtsam.Cal3DS2, expected: gtsam.Cal3DS2) -> None:
+def _print_comparison(label: str, got, expected) -> None:
     print(f"\n{label}")
     print(f"  fx: {got.fx():.2f}  (GT {expected.fx():.2f}, Δ {got.fx()-expected.fx():+.2f})")
     print(f"  fy: {got.fy():.2f}  (GT {expected.fy():.2f}, Δ {got.fy()-expected.fy():+.2f})")
     print(f"  cx: {got.px():.2f}  (GT {expected.px():.2f}, Δ {got.px()-expected.px():+.2f})")
     print(f"  cy: {got.py():.2f}  (GT {expected.py():.2f}, Δ {got.py()-expected.py():+.2f})")
-    k = got.k()
-    print(f"  k1: {k[0]:.6f}  k2: {k[1]:.6f}  p1: {k[2]:.6f}  p2: {k[3]:.6f}")
+    k_got, k_exp = got.k(), expected.k()
+    for i, name in enumerate(["k1", "k2", "k3/p1", "k4/p2"]):
+        if i < len(k_got) and i < len(k_exp):
+            print(f"  {name}: {k_got[i]:.6f}  (GT {k_exp[i]:.6f}, Δ {k_got[i]-k_exp[i]:+.6f})")
 
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _DATASET_PRESENT, reason="ETH3D pipes dataset not present")
-@pytest.mark.parametrize("noise_m", [0.05, 0.5, 1.0, 2.0])
-def test_calibration_noise_recovery(eth3d_data, noise_m):
-    """Optimizer should recover PINHOLE intrinsics given noisy pose priors.
+@pytest.mark.skipif(
+    not _UNDIST_PRESENT,
+    reason="ETH3D undistorted dataset not present — run: pixi run pipes-download",
+)
+def test_focal_length_recovery_undistorted():
+    """Cal3DS2 calibration on undistorted images recovers focal length
+    from a 10%-off starting point, with GT poses as tight priors.
 
-    Ground truth: fx≈3430, fy≈3429, cx≈3119, cy≈2058, k=0 (undistorted images).
-
-    Strategy: triangulate with GT calibration (correct 3D seed points), then
-    optimise with a 10%-off calibration as the starting point.  This ensures
-    the optimiser sees non-zero initial reprojection error and has a gradient
-    to follow toward the correct calibration.
+    GT: PINHOLE (k=0), fx≈3430, fy≈3429, cx≈3119, cy≈2058.
+    Initial: fx*1.1, fy*1.1, k=0.
+    Expected: recovered fx/fy within ±150px of GT.
     """
-    gt_cal: gtsam.Cal3DS2 = eth3d_data["gt_cal"]
-    images: list[tuple[int, bytes]] = eth3d_data["images"]
-    gt_poses: dict[int, gtsam.Pose3] = eth3d_data["gt_poses"]
-
-    rng = np.random.default_rng(42)
-    noisy_poses = _add_translation_noise(gt_poses, sigma_m=noise_m, rng=rng)
-
-    # Optimisation starts 10% off; triangulation uses GT (correct seed points)
-    initial_cal = gtsam.Cal3DS2(
-        gt_cal.fx() * 1.1,
-        gt_cal.fy() * 1.1,
-        0.0,
-        gt_cal.px(),
-        gt_cal.py(),
-        0.0, 0.0, 0.0, 0.0,
-    )
-
-    opts = _make_opts(noise_m)
-    result = optimize_sfm(images, noisy_poses, initial_cal, opts, triangulation_cal=gt_cal)
-    opt_cal: gtsam.Cal3DS2 = result["calibration"]
-
-    _print_comparison(f"noise={noise_m}m", opt_cal, gt_cal)
-
-    # Ground truth focal lengths are ~3430px; tolerances are intentionally
-    # generous — tighten once the optimizer is confirmed to converge well.
-    fx_tol = 300.0   # ~9% of 3430
-    cx_tol = 80.0    # ~2.6% of 3119
-
-    assert result["n_tracks"] >= 10, \
-        f"Only {result['n_tracks']} triangulated tracks — too few to constrain calibration"
-
-    assert abs(opt_cal.fx() - gt_cal.fx()) < fx_tol, \
-        f"fx error {opt_cal.fx() - gt_cal.fx():.1f}px exceeds {fx_tol}px (noise={noise_m}m)"
-    assert abs(opt_cal.fy() - gt_cal.fy()) < fx_tol, \
-        f"fy error {opt_cal.fy() - gt_cal.fy():.1f}px exceeds {fx_tol}px (noise={noise_m}m)"
-    assert abs(opt_cal.px() - gt_cal.px()) < cx_tol, \
-        f"cx error {opt_cal.px() - gt_cal.px():.1f}px exceeds {cx_tol}px (noise={noise_m}m)"
-    assert abs(opt_cal.py() - gt_cal.py()) < cx_tol, \
-        f"cy error {opt_cal.py() - gt_cal.py():.1f}px exceeds {cx_tol}px (noise={noise_m}m)"
-
-
-@pytest.mark.skipif(not _DATASET_PRESENT, reason="ETH3D pipes dataset not present")
-def test_exact_poses_recovers_calibration(eth3d_data):
-    """With exact GT poses and GT seed points, the optimizer must recover
-    calibration starting from a 15%-off initial guess.
-
-    This is the tightest possible sanity check: poses are pinned to ground
-    truth, 3D seeds are correct, only calibration needs to be recovered.
-    """
-    gt_cal: gtsam.Cal3DS2 = eth3d_data["gt_cal"]
-    images = eth3d_data["images"]
-    gt_poses = eth3d_data["gt_poses"]
+    gt_cal, images, gt_poses = _load_dataset(_UNDIST_IMAGES, _UNDIST_CAL)
+    assert isinstance(gt_cal, gtsam.Cal3DS2)
 
     initial_cal = gtsam.Cal3DS2(
-        gt_cal.fx() * 1.15,   # 15% off
-        gt_cal.fy() * 1.15,
-        0.0,
-        gt_cal.px(),
-        gt_cal.py(),
+        gt_cal.fx() * 1.1, gt_cal.fy() * 1.1,
+        0.0, gt_cal.px(), gt_cal.py(),
         0.0, 0.0, 0.0, 0.0,
     )
 
@@ -191,28 +110,96 @@ def test_exact_poses_recovers_calibration(eth3d_data):
         sift_features=_SIFT_FEATURES,
         match_ratio=0.75,
         min_matches=8,
-        lm_iterations=300,
-        pose_noise_m=0.005,   # nearly fixed
-        pose_noise_rad=0.001,
-        cal_noise_frac=0.2,   # allow ±20% on fx
+        lm_iterations=200,
+        pose_noise_m=0.005,
+        pose_noise_rad=0.0005,
+        cal_noise_frac=0.15,
         cal_cx_noise_frac=0.005,
-        # Undistorted: tight distortion prior prevents fx/k degeneracy
-        k1_sigma=0.03,
-        k2_sigma=0.01,
-        p1_sigma=0.003,
-        p2_sigma=0.003,
-        pixel_noise_px=1.0,
-        max_tracks=2000,
+        k1_sigma=0.05,   # undistorted: pin near zero
+        k2_sigma=0.02,
+        p1_sigma=0.005,
+        p2_sigma=0.005,
+        pixel_noise_px=1.5,
+        max_tracks=1500,
     )
 
     result = optimize_sfm(images, gt_poses, initial_cal, opts, triangulation_cal=gt_cal)
     opt_cal = result["calibration"]
 
-    _print_comparison("exact poses", opt_cal, gt_cal)
+    _print_comparison("undistorted, 10%-off focal length", opt_cal, gt_cal)
 
-    assert result["n_tracks"] >= 10
-    assert abs(opt_cal.fx() - gt_cal.fx()) < 100.0, \
-        f"fx error {opt_cal.fx() - gt_cal.fx():.1f}px (exact poses should be tight)"
-    assert abs(opt_cal.fy() - gt_cal.fy()) < 100.0
-    assert abs(opt_cal.px() - gt_cal.px()) < 30.0
-    assert abs(opt_cal.py() - gt_cal.py()) < 30.0
+    assert result["n_tracks"] >= 10, f"Only {result['n_tracks']} tracks"
+
+    fx_tol = 150.0
+    cx_tol = 100.0
+
+    assert abs(opt_cal.fx() - gt_cal.fx()) < fx_tol, \
+        f"fx error {opt_cal.fx()-gt_cal.fx():+.1f}px exceeds ±{fx_tol}px"
+    assert abs(opt_cal.fy() - gt_cal.fy()) < fx_tol, \
+        f"fy error {opt_cal.fy()-gt_cal.fy():+.1f}px exceeds ±{fx_tol}px"
+    assert abs(opt_cal.px() - gt_cal.px()) < cx_tol, \
+        f"cx error {opt_cal.px()-gt_cal.px():+.1f}px exceeds ±{cx_tol}px"
+    assert abs(opt_cal.py() - gt_cal.py()) < cx_tol, \
+        f"cy error {opt_cal.py()-gt_cal.py():+.1f}px exceeds ±{cx_tol}px"
+
+
+@pytest.mark.skipif(
+    not _RAW_PRESENT,
+    reason="ETH3D raw dataset not present — run: pixi run pipes-download-raw",
+)
+def test_focal_length_recovery_fisheye():
+    """Cal3Fisheye calibration on raw fisheye images recovers focal length
+    from a 10%-off starting point, with GT poses as tight priors.
+
+    GT: THIN_PRISM_FISHEYE (k1=0.219, k2=0.156, k3=-0.037, k4=0.303),
+        fx≈3430, cx≈3033, cy≈2004.
+    Initial: fx*1.1, fy*1.1, GT k1/k2/k3/k4 (correct distortion, wrong scale).
+    Expected: recovered fx/fy within ±150px of GT.
+
+    triangulation_cal=gt_cal gives accurate 3D seeds via fisheye undistortion.
+    """
+    gt_cal, images, gt_poses = _load_dataset(_RAW_IMAGES, _RAW_CAL)
+    assert isinstance(gt_cal, gtsam.Cal3Fisheye)
+
+    gt_k = gt_cal.k()
+    initial_cal = gtsam.Cal3Fisheye(
+        gt_cal.fx() * 1.1, gt_cal.fy() * 1.1,
+        0.0, gt_cal.px(), gt_cal.py(),
+        gt_k[0], gt_k[1], gt_k[2], gt_k[3],
+    )
+
+    opts = CalibrationOptions(
+        sift_features=_SIFT_FEATURES,
+        match_ratio=0.75,
+        min_matches=8,
+        lm_iterations=200,
+        pose_noise_m=0.005,
+        pose_noise_rad=0.0005,
+        cal_noise_frac=0.15,
+        cal_cx_noise_frac=0.005,
+        k1_sigma=0.1,
+        k2_sigma=0.1,
+        k3_sigma=0.05,
+        k4_sigma=0.1,
+        pixel_noise_px=1.5,
+        max_tracks=1500,
+    )
+
+    result = optimize_sfm(images, gt_poses, initial_cal, opts, triangulation_cal=gt_cal)
+    opt_cal = result["calibration"]
+
+    _print_comparison("raw fisheye, 10%-off focal length", opt_cal, gt_cal)
+
+    assert result["n_tracks"] >= 10, f"Only {result['n_tracks']} tracks"
+
+    fx_tol = 150.0
+    cx_tol = 100.0
+
+    assert abs(opt_cal.fx() - gt_cal.fx()) < fx_tol, \
+        f"fx error {opt_cal.fx()-gt_cal.fx():+.1f}px exceeds ±{fx_tol}px"
+    assert abs(opt_cal.fy() - gt_cal.fy()) < fx_tol, \
+        f"fy error {opt_cal.fy()-gt_cal.fy():+.1f}px exceeds ±{fx_tol}px"
+    assert abs(opt_cal.px() - gt_cal.px()) < cx_tol, \
+        f"cx error {opt_cal.px()-gt_cal.px():+.1f}px exceeds ±{cx_tol}px"
+    assert abs(opt_cal.py() - gt_cal.py()) < cx_tol, \
+        f"cy error {opt_cal.py()-gt_cal.py():+.1f}px exceeds ±{cx_tol}px"

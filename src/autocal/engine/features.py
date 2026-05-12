@@ -30,7 +30,7 @@ Track building
 Triangulation
 -------------
     pt3d = triangulate(kp_a, kp_b, K, pose_a, pose_b)
-    # pose_*: gtsam.Pose3 (R_cw, t = camera in world)
+    # pose_*: gtsam.Pose3 (R_wc, t = camera in world)
     # Returns shape-(3,) point or None if degenerate.
 
 Visualisation
@@ -194,7 +194,7 @@ def triangulate(
         kp_a:   shape-(2,) pixel [u, v] in image A.
         kp_b:   shape-(2,) pixel [u, v] in image B.
         K:      3×3 intrinsic matrix (same for both cameras, square pixels assumed).
-        pose_a: gtsam.Pose3 for camera A (R_cw, t = camera in world).
+        pose_a: gtsam.Pose3 for camera A (R_wc, t = camera in world).
         pose_b: gtsam.Pose3 for camera B.
 
     Returns:
@@ -202,10 +202,11 @@ def triangulate(
     """
     # Build 3×4 projection matrices P = K @ [R_cw | -R_cw @ t_world]
     def _projection(pose: Any) -> np.ndarray:
-        R = pose.rotation().matrix()   # R_cw, shape (3,3)
-        t = pose.translation()          # camera in world, shape (3,)
-        t_cam = -R @ t                  # translation in camera frame
-        Rt = np.hstack([R, t_cam[:, None]])
+        R_wc = pose.rotation().matrix()  # camera→world, shape (3,3)
+        R_cw = R_wc.T                    # world→camera
+        t = pose.translation()            # camera position in world
+        t_cam = -R_cw @ t
+        Rt = np.hstack([R_cw, t_cam[:, None]])
         return K @ Rt
 
     P_a = _projection(pose_a)

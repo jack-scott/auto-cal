@@ -47,6 +47,9 @@ cmd = ["python", "tools/run_calibration.py",
        "data/eth3d_pipes_calibrated.mcap"]
 depends-on = ["pipes-download"]
 
+[tasks.pipes-download-raw]
+cmd = ["python", "tools/download_eth3d_pipes_raw.py"]
+
 # --- Misc -------------------------------------------------------------------
 
 [tasks.test]

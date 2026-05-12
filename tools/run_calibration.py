@@ -34,8 +34,6 @@ def main() -> None:
     parser.add_argument("--cal-noise-frac", type=float, default=0.3)
     parser.add_argument("--cal-cx-noise-frac", type=float, default=0.01)
     parser.add_argument("--pixel-noise-px", type=float, default=2.0)
-    parser.add_argument("--nadir", action="store_true",
-                        help="Initialise cameras looking straight down (UAV nadir survey)")
     parser.add_argument("--max-tracks", type=int, default=2000,
                         help="Max triangulated tracks in GTSAM graph (default: 2000)")
     args = parser.parse_args()
@@ -60,7 +58,6 @@ def main() -> None:
         cal_noise_frac=args.cal_noise_frac,
         cal_cx_noise_frac=args.cal_cx_noise_frac,
         pixel_noise_px=args.pixel_noise_px,
-        nadir_camera=args.nadir,
         max_tracks=args.max_tracks,
     )
 

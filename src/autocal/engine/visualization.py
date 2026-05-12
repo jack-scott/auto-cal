@@ -52,7 +52,7 @@ def write_camera_path(
 
     Args:
         writer:   Open McapWriter to write into.
-        poses:    Mapping of Unix-nanosecond timestamp → GTSAM Pose3 (R_cw, t=cam in world).
+        poses:    Mapping of Unix-nanosecond timestamp → GTSAM Pose3 (R_wc, t=cam in world).
         topic:    MCAP topic string, e.g. "/scene/cameras/optimized".
         r,g,b:    RGB colour components in [0, 1].
         cal:      Optional Cal3Bundler used to shape the frustum.  If None a
@@ -84,7 +84,7 @@ def write_camera_path(
     for t_ns in sorted_ts:
         pose = poses[t_ns]
         t_cam = pose.translation()          # camera position in world (ENU)
-        R_wc = pose.rotation().inverse().matrix()  # rotates camera→world
+        R_wc = pose.rotation().matrix()     # camera→world (R_wc stored natively)
 
         # Transform frustum corners to world frame
         corners_world = (R_wc @ corners_cam.T).T + t_cam

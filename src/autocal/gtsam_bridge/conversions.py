@@ -7,17 +7,17 @@ Camera frame (ROS REP-103): X right, Y down, Z forward (into scene)
 World frame (ENU / REP-103): X east, Y north, Z up
 
 GTSAM Pose3(R, t):
-  R = rotation()    → R_cw  (world→camera, rotates world vectors into camera frame)
+  R = rotation()    → R_wc  (camera→world; GTSAM's native convention)
   t = translation() → position of camera in world frame (numpy ndarray shape-(3,))
 
 FrameTransform(parent, child, translation, rotation):
   translation = child origin in parent frame → same as Pose3.translation()
   rotation    = quaternion [x,y,z,w] that rotates child vectors into parent frame
-              = R_wc = R_cw.inverse()
+              = R_wc  (same convention as Pose3.rotation())
 
 Therefore:
-  Pose3 → FrameTransform: rotation = pose.rotation().inverse().toQuaternion()
-  FrameTransform → Pose3: R_cw = R_wc.inverse(); build from rotation matrix
+  Pose3 → FrameTransform: rotation = pose.rotation().toQuaternion()  (no inversion)
+  FrameTransform → Pose3: build R_wc directly from quaternion
 
 GTSAM quaternion API:
   Rot3.toQuaternion()  → gtsam.Quaternion  (.w(), .x(), .y(), .z())
@@ -50,21 +50,17 @@ from autocal.io.mcap_writer import ns_to_timestamp
 def pose3_from_frame_transform(ft: FrameTransform) -> gtsam.Pose3:
     """Convert a FrameTransform proto to a GTSAM Pose3.
 
-    The TF rotation (R_wc) is inverted to produce R_cw as expected by Pose3.
-
     Args:
         ft: FrameTransform message where translation = child origin in parent
-            and rotation [x,y,z,w] = R_parent_child (= R_wc for map→camera_link).
+            and rotation [x,y,z,w] = R_wc (camera→world = child→parent).
 
     Returns:
-        gtsam.Pose3 with rotation=R_cw and translation=camera position in world.
+        gtsam.Pose3 with rotation=R_wc and translation=camera position in world.
     """
     t = np.array([ft.translation.x, ft.translation.y, ft.translation.z])
-    # Build R_wc from quaternion, then invert to get R_cw
     q = ft.rotation
-    R_wc = _quat_xyzw_to_matrix(q.x, q.y, q.z, q.w)
-    R_cw = gtsam.Rot3(R_wc).inverse()
-    return gtsam.Pose3(R_cw, gtsam.Point3(*t))
+    R_wc = gtsam.Rot3(_quat_xyzw_to_matrix(q.x, q.y, q.z, q.w))
+    return gtsam.Pose3(R_wc, gtsam.Point3(*t))
 
 
 def frame_transform_from_pose3(
@@ -76,14 +72,14 @@ def frame_transform_from_pose3(
     """Convert a GTSAM Pose3 to a FrameTransform proto.
 
     Args:
-        pose:            GTSAM Pose3 (R_cw, translation = camera in world).
+        pose:            GTSAM Pose3 (R_wc, translation = camera in world).
         parent_frame_id: e.g. "map"
         child_frame_id:  e.g. "camera_link"
         t_ns:            Timestamp in Unix nanoseconds.
 
     Returns:
         FrameTransform with translation = camera position in map,
-        rotation [x,y,z,w] = R_wc (R_cw.inverse()).
+        rotation [x,y,z,w] = R_wc (camera→world).
     """
     ft = FrameTransform()
     ft.timestamp.CopyFrom(ns_to_timestamp(t_ns))
@@ -95,8 +91,8 @@ def frame_transform_from_pose3(
     ft.translation.y = float(t[1])
     ft.translation.z = float(t[2])
 
-    # pose.rotation() = R_cw; TF wants R_wc = R_cw.inverse()
-    q = pose.rotation().inverse().toQuaternion()
+    # pose.rotation() = R_wc; TF rotation = R_wc directly
+    q = pose.rotation().toQuaternion()
     ft.rotation.w = float(q.w())
     ft.rotation.x = float(q.x())
     ft.rotation.y = float(q.y())
