@@ -37,7 +37,7 @@ def write_camera_path(
     r: float,
     g: float,
     b: float,
-    cal: gtsam.Cal3Bundler | None = None,
+    cal: object | None = None,
     frame_id: str = "map",
 ) -> None:
     """Write camera frustum markers and path lines to an MCAP writer.

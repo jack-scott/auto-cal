@@ -7,6 +7,7 @@ Content: 14 DSLR images of an indoor industrial pipe scene + COLMAP intrinsics.
 Topics written:
   /camera/image         foxglove.CompressedImage
   /camera/calibration   foxglove.CameraCalibration  (from COLMAP cameras.txt)
+  /tf                   foxglove.FrameTransform      (COLMAP GT poses)
 
 The ETH3D dataset does not include GPS; cameras are expressed in an arbitrary
 COLMAP world frame (not ENU).  Timestamps are synthetic (1s apart).
@@ -24,6 +25,8 @@ import numpy as np
 from foxglove_schemas_protobuf.CameraCalibration_pb2 import CameraCalibration
 from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 
+from autocal.gtsam_bridge.conversions import frame_transform_from_pose3
+from autocal.io.colmap import parse_images
 from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
 
 URL = "https://www.eth3d.net/data/pipes_dslr_undistorted.7z"
@@ -149,10 +152,12 @@ def convert() -> None:
 
     cameras = _parse_colmap_cameras(cameras_txt)
     image_records = _parse_colmap_images(images_txt)
+    poses_named = parse_images(images_txt)
 
     # Find all image files
     img_root = EXTRACT_DIR
     print(f"Found {len(image_records)} image records in {images_txt}")
+    print(f"Found {len(poses_named)} poses in {images_txt}")
 
     print(f"Writing {OUTPUT} ...")
     with McapWriter(OUTPUT) as writer:
@@ -183,6 +188,12 @@ def convert() -> None:
             img_msg.format = "jpeg"
             img_msg.data = img_path.read_bytes()
             writer.write("/camera/image", img_msg, t_ns)
+
+            # Write COLMAP GT pose as /tf
+            pose = poses_named.get(rec["name"])
+            if pose is not None:
+                ft = frame_transform_from_pose3(pose, "map", "camera_link", t_ns)
+                writer.write("/tf", ft, t_ns)
 
             print(f"\r  {i+1}/{len(image_records)}  {rec['name']}", end="", flush=True)
 

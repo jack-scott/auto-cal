@@ -6,7 +6,7 @@ Reads from the directory extracted by `pixi run pipes-download-raw`:
   data/eth3d_pipes/pipes/dslr_calibration_jpg/     COLMAP THIN_PRISM_FISHEYE calibration
 
 Writes:
-  data/eth3d_pipes_raw.mcap   images + equidistant (Kannala-Brandt) calibration
+  data/eth3d_pipes_raw.mcap   images + equidistant (Kannala-Brandt) calibration + COLMAP GT poses
 
 Run:
     pixi run pipe-raw-prepare
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from autocal.gtsam_bridge.conversions import camera_calibration_from_cal3fisheye
+from autocal.gtsam_bridge.conversions import camera_calibration_from_cal3fisheye, frame_transform_from_pose3
 from autocal.io.colmap import parse_cameras, parse_images
 from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
 from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
@@ -37,10 +37,6 @@ def main() -> None:
     cal, width, height = parse_cameras(CAL_DIR / "cameras.txt")
     poses_named = parse_images(CAL_DIR / "images.txt")
 
-    # Sort by image name so order matches the undistorted dataset
-    names = sorted(poses_named.keys())
-    jpgs = {Path(n).name: n for n in names}
-
     image_files = sorted(IMAGE_DIR.glob("*.JPG"))
     if not image_files:
         raise FileNotFoundError(f"No .JPG images in {IMAGE_DIR}")
@@ -48,6 +44,9 @@ def main() -> None:
     print(f"Images:      {len(image_files)}")
     print(f"Calibration: {cal}")
     print(f"Output:      {OUTPUT}")
+
+    # Map short filename → full name key used in poses_named
+    short_to_full = {Path(n).name: n for n in poses_named.keys()}
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     with McapWriter(OUTPUT) as writer:
@@ -64,6 +63,14 @@ def main() -> None:
             img_msg.format = "jpeg"
             img_msg.data = img_path.read_bytes()
             writer.write("/camera/image", img_msg, t_ns)
+
+            # Write COLMAP GT pose as /tf
+            full_name = short_to_full.get(img_path.name)
+            if full_name is not None:
+                pose = poses_named.get(full_name)
+                if pose is not None:
+                    ft = frame_transform_from_pose3(pose, "map", "camera_link", t_ns)
+                    writer.write("/tf", ft, t_ns)
 
             print(f"\r  {i+1}/{len(image_files)}  {img_path.name}", end="", flush=True)
 

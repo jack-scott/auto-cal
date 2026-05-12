@@ -251,6 +251,7 @@ def optimize_poses(
 
     return {
         "poses": opt_poses,
+        "initial_poses": poses,   # pre-optimisation (E-matrix chain or provided priors)
         "n_tracks": len(triangulated),
         "keypoints": keypoints,
         "triangulated": triangulated,
