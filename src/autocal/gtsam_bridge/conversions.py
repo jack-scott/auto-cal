@@ -173,6 +173,72 @@ def camera_calibration_from_cal3ds2(
     return cc
 
 
+def cal3fisheye_from_camera_calibration(cc: CameraCalibration) -> gtsam.Cal3Fisheye:
+    """Extract a Cal3Fisheye from a CameraCalibration proto.
+
+    distortion_model must be "equidistant" (Kannala-Brandt fisheye).
+    D = [k1, k2, k3, k4].
+    """
+    if cc.distortion_model != "equidistant":
+        raise ValueError(
+            f"distortion_model must be 'equidistant' for Cal3Fisheye, "
+            f"got {cc.distortion_model!r}"
+        )
+    if len(cc.K) < 9:
+        raise ValueError(f"CameraCalibration.K must have 9 elements, got {len(cc.K)}")
+    fx   = cc.K[0]
+    fy   = cc.K[4]
+    skew = cc.K[1]
+    cx   = cc.K[2]
+    cy   = cc.K[5]
+    d    = list(cc.D)
+    k1 = d[0] if len(d) > 0 else 0.0
+    k2 = d[1] if len(d) > 1 else 0.0
+    k3 = d[2] if len(d) > 2 else 0.0
+    k4 = d[3] if len(d) > 3 else 0.0
+    return gtsam.Cal3Fisheye(fx, fy, skew, cx, cy, k1, k2, k3, k4)
+
+
+def camera_calibration_from_cal3fisheye(
+    cal: gtsam.Cal3Fisheye,
+    frame_id: str,
+    t_ns: int,
+    width: int,
+    height: int,
+) -> CameraCalibration:
+    """Build a CameraCalibration proto from a Cal3Fisheye.
+
+    Writes distortion_model="equidistant", D=[k1, k2, k3, k4].
+    """
+    fx = cal.fx()
+    fy = cal.fy()
+    cx = cal.px()
+    cy = cal.py()
+    k  = cal.k()
+    k1, k2, k3, k4 = float(k[0]), float(k[1]), float(k[2]), float(k[3])
+
+    cc = CameraCalibration()
+    cc.timestamp.CopyFrom(ns_to_timestamp(t_ns))
+    cc.frame_id = frame_id
+    cc.width = width
+    cc.height = height
+    cc.distortion_model = "equidistant"
+    cc.D.extend([k1, k2, k3, k4])
+    cc.K.extend([fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0])
+    cc.R.extend([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    cc.P.extend([fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0])
+    return cc
+
+
+def calibration_from_mcap_msg(
+    cc: CameraCalibration,
+) -> gtsam.Cal3DS2 | gtsam.Cal3Fisheye:
+    """Auto-detect calibration type from distortion_model and return the right GTSAM object."""
+    if cc.distortion_model == "equidistant":
+        return cal3fisheye_from_camera_calibration(cc)
+    return cal3ds2_from_camera_calibration(cc)
+
+
 def cal3bundler_from_camera_calibration(cc: CameraCalibration) -> gtsam.Cal3Bundler:
     """Extract a Cal3Bundler from a CameraCalibration proto.
 

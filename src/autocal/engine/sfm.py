@@ -72,7 +72,7 @@ class SfmOptions:
 
 def optimize_poses(
     images: list[tuple[int, bytes]],
-    calibration: gtsam.Cal3DS2,
+    calibration: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
     opts: SfmOptions,
     initial_poses: dict[int, gtsam.Pose3] | None = None,
 ) -> dict:
@@ -133,6 +133,25 @@ def optimize_poses(
     tracks = build_tracks(matches_per_pair)
 
     # ------------------------------------------------------------------ #
+    # Undistort keypoints for geometry (triangulation + essential matrix)
+    # ------------------------------------------------------------------ #
+    _fisheye = isinstance(calibration, gtsam.Cal3Fisheye)
+    K = _cal_to_K(calibration)
+    kp_dist = np.array(calibration.k(), dtype=np.float64)
+    if np.any(kp_dist != 0.0):
+        keypoints_for_geo: dict[int, np.ndarray] = {}
+        for img_id, kps in keypoints.items():
+            pts = kps.reshape(-1, 1, 2).astype(np.float64)
+            if _fisheye:
+                D = kp_dist[:4].reshape(4, 1)
+                undist = cv2.fisheye.undistortPoints(pts, K, D, P=K)
+            else:
+                undist = cv2.undistortPoints(pts, K, kp_dist[:4], P=K)
+            keypoints_for_geo[img_id] = undist.reshape(-1, 2).astype(np.float32)
+    else:
+        keypoints_for_geo = keypoints
+
+    # ------------------------------------------------------------------ #
     # Initial poses
     # ------------------------------------------------------------------ #
     has_priors = initial_poses is not None
@@ -140,14 +159,13 @@ def optimize_poses(
         poses: dict[int, gtsam.Pose3] = dict(initial_poses)
     else:
         poses = _chain_essential_matrix(
-            img_ids, keypoints, matches_per_pair, calibration,
+            img_ids, keypoints_for_geo, matches_per_pair, K,
         )
 
     # ------------------------------------------------------------------ #
     # Triangulate
     # ------------------------------------------------------------------ #
-    K = _cal_to_K(calibration)
-    triangulate_tracks(tracks, keypoints, K, poses)
+    triangulate_tracks(tracks, keypoints_for_geo, K, poses)
     good = [
         t for t in tracks
         if t.point3d is not None and _all_positive_depth(t.point3d, t.observations, poses)
@@ -197,11 +215,18 @@ def optimize_poses(
                 continue
             kp = keypoints[img_id][kp_idx]
             measured = np.array([float(kp[0]), float(kp[1])])
-            graph.add(gtsam.GenericProjectionFactorCal3DS2(
-                measured, pixel_noise,
-                X(id_to_idx[img_id]), P(j),
-                calibration,
-            ))
+            if _fisheye:
+                graph.add(gtsam.GenericProjectionFactorCal3Fisheye(
+                    measured, pixel_noise,
+                    X(id_to_idx[img_id]), P(j),
+                    calibration,
+                ))
+            else:
+                graph.add(gtsam.GenericProjectionFactorCal3DS2(
+                    measured, pixel_noise,
+                    X(id_to_idx[img_id]), P(j),
+                    calibration,
+                ))
 
     # ------------------------------------------------------------------ #
     # Optimise
@@ -236,7 +261,7 @@ def optimize_poses(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _cal_to_K(cal: gtsam.Cal3DS2) -> np.ndarray:
+def _cal_to_K(cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye) -> np.ndarray:
     return np.array([
         [cal.fx(), cal.skew(), cal.px()],
         [0.0,      cal.fy(),   cal.py()],
@@ -247,12 +272,13 @@ def _cal_to_K(cal: gtsam.Cal3DS2) -> np.ndarray:
 def _filter_by_reproj(
     tracks: list[Track],
     keypoints: dict[int, np.ndarray],
-    cal: gtsam.Cal3DS2,
+    cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
     poses: dict[int, gtsam.Pose3],
     max_err_px: float,
 ) -> list[Track]:
     """Keep only tracks where every observation reprojects within max_err_px."""
-    K = _cal_to_K(cal)
+    _fisheye = isinstance(cal, gtsam.Cal3Fisheye)
+    k_coeffs = np.array(cal.k(), dtype=np.float64)
     kept = []
     for track in tracks:
         ok = True
@@ -262,13 +288,28 @@ def _filter_by_reproj(
             pose = poses[img_id]
             R_cw = pose.rotation().matrix().T
             p_cam = R_cw @ (track.point3d - pose.translation())
-            if p_cam[2] <= 0:
+            x, y, z = p_cam
+            if z <= 0:
                 ok = False
                 break
-            proj = K @ p_cam
-            proj /= proj[2]
+            if _fisheye:
+                r = np.sqrt(x*x + y*y)
+                if r < 1e-10:
+                    pu, pv = cal.px(), cal.py()
+                else:
+                    theta = np.arctan2(r, z)
+                    t2 = theta * theta
+                    rd = theta * (1 + k_coeffs[0]*t2 + k_coeffs[1]*t2**2
+                                  + k_coeffs[2]*t2**3 + k_coeffs[3]*t2**4)
+                    s = rd / r
+                    pu = cal.fx() * s * x + cal.px()
+                    pv = cal.fy() * s * y + cal.py()
+            else:
+                xn, yn = x / z, y / z
+                pu = cal.fx() * xn + cal.px()
+                pv = cal.fy() * yn + cal.py()
             obs = keypoints[img_id][kp_idx]
-            if np.linalg.norm(proj[:2] - obs) > max_err_px:
+            if np.hypot(pu - obs[0], pv - obs[1]) > max_err_px:
                 ok = False
                 break
         if ok:
@@ -296,14 +337,14 @@ def _chain_essential_matrix(
     img_ids: list[int],
     keypoints: dict[int, np.ndarray],
     matches_per_pair: dict[tuple[int, int], list[tuple[int, int]]],
-    calibration: gtsam.Cal3DS2,
+    K: np.ndarray,
 ) -> dict[int, gtsam.Pose3]:
     """Initialise poses by chaining essential-matrix relative poses.
 
     Frame 0 is placed at the origin with optical axis along world X+.
     Translation is unit-scale (GTSAM resolves scale from feature tracks).
+    keypoints should be undistorted (caller's responsibility).
     """
-    K = _cal_to_K(calibration)
 
     # Camera facing X+: camera Z (optical) = world X+
     R_wc_0 = gtsam.Rot3(np.array([
