@@ -176,12 +176,14 @@ def camera_calibration_from_cal3ds2(
 def cal3fisheye_from_camera_calibration(cc: CameraCalibration) -> gtsam.Cal3Fisheye:
     """Extract a Cal3Fisheye from a CameraCalibration proto.
 
-    distortion_model must be "equidistant" (Kannala-Brandt fisheye).
+    distortion_model must be "kannala_brandt" (Foxglove name) or "equidistant"
+    (legacy alias).  Both map to the Kannala-Brandt / OpenCV fisheye model.
     D = [k1, k2, k3, k4].
     """
-    if cc.distortion_model != "equidistant":
+    _FISHEYE_MODELS = {"kannala_brandt", "equidistant"}
+    if cc.distortion_model not in _FISHEYE_MODELS:
         raise ValueError(
-            f"distortion_model must be 'equidistant' for Cal3Fisheye, "
+            f"distortion_model must be 'kannala_brandt' for Cal3Fisheye, "
             f"got {cc.distortion_model!r}"
         )
     if len(cc.K) < 9:
@@ -208,7 +210,7 @@ def camera_calibration_from_cal3fisheye(
 ) -> CameraCalibration:
     """Build a CameraCalibration proto from a Cal3Fisheye.
 
-    Writes distortion_model="equidistant", D=[k1, k2, k3, k4].
+    Writes distortion_model="kannala_brandt", D=[k1, k2, k3, k4].
     """
     fx = cal.fx()
     fy = cal.fy()
@@ -222,7 +224,7 @@ def camera_calibration_from_cal3fisheye(
     cc.frame_id = frame_id
     cc.width = width
     cc.height = height
-    cc.distortion_model = "equidistant"
+    cc.distortion_model = "kannala_brandt"
     cc.D.extend([k1, k2, k3, k4])
     cc.K.extend([fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0])
     cc.R.extend([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
@@ -234,7 +236,7 @@ def calibration_from_mcap_msg(
     cc: CameraCalibration,
 ) -> gtsam.Cal3DS2 | gtsam.Cal3Fisheye:
     """Auto-detect calibration type from distortion_model and return the right GTSAM object."""
-    if cc.distortion_model == "equidistant":
+    if cc.distortion_model in ("kannala_brandt", "equidistant"):
         return cal3fisheye_from_camera_calibration(cc)
     return cal3ds2_from_camera_calibration(cc)
 

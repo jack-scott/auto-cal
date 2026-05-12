@@ -12,18 +12,20 @@ poses), runs visual SfM (essential-matrix chaining or pose-prior initialisation
   /points/sfm              sparse 3D point cloud
   /scene/cameras/initial   pre-optimisation camera frustums + path (blue)
   /scene/cameras/optimized post-optimisation camera frustums + path (green)
+  /ape                     per-frame APE vs GT (only when /tf present in input)
+                             fields: translation_m, rotation_deg
 
 If /tf is present in the input MCAP the poses are used as initial values and
 soft priors, bypassing essential-matrix chaining.
 
 Usage:
-    pixi run python tools/run_sfm.py input.mcap output.mcap [options]
+    pixi run python pipelines/sfm.py input.mcap output.mcap [options]
 
 Options:
     --sift-features N     Max SIFT features per image (default: 1000)
     --match-ratio R       Lowe ratio test (default: 0.75)
     --min-matches N       Min matches per pair (default: 8)
-    --lm-iterations N     Max LM iterations (default: 100)
+    --lm-iterations N     Max Dogleg iterations (default: 200)
     --pixel-noise-px P    Reprojection pixel noise σ (default: 1.5)
     --max-tracks N        Max triangulated tracks in graph (default: 1500)
     --pose-noise-m M      Pose prior translation σ (default: 0.1, only with /tf)
@@ -53,7 +55,7 @@ from autocal.gtsam_bridge.conversions import (
     frame_transform_from_pose3,
     pose3_from_frame_transform,
 )
-from autocal.io.mcap_reader import get_topic_map, iter_messages
+from autocal.io.mcap_reader import get_topic_map, iter_messages, load_sift_features
 from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
 from autocal.optics.camera import overlay_keypoints
 
@@ -64,6 +66,8 @@ SIFT_TOPIC         = "/camera/sift_overlay"
 POINTS_TOPIC       = "/points/sfm"
 SCENE_INITIAL_TOPIC   = "/scene/cameras/initial"
 SCENE_OPTIMIZED_TOPIC = "/scene/cameras/optimized"
+APE_TOPIC             = "/ape"
+SIFT_FEATURES_TOPIC   = "/camera/sift_features"
 
 
 def _make_point_cloud(pts: list, t_ns: int) -> PointCloud:
@@ -91,11 +95,28 @@ def main() -> None:
     parser.add_argument("--sift-features",  type=int,   default=1000)
     parser.add_argument("--match-ratio",    type=float, default=0.75)
     parser.add_argument("--min-matches",    type=int,   default=8)
-    parser.add_argument("--lm-iterations",  type=int,   default=100)
+    parser.add_argument("--lm-iterations",  type=int,   default=200)
     parser.add_argument("--pixel-noise-px", type=float, default=1.5)
     parser.add_argument("--max-tracks",     type=int,   default=1500)
-    parser.add_argument("--pose-noise-m",   type=float, default=0.1)
-    parser.add_argument("--pose-noise-rad", type=float, default=0.01)
+    parser.add_argument("--pose-noise-m",     type=float, default=0.1)
+    parser.add_argument("--pose-noise-rad",   type=float, default=0.01)
+    parser.add_argument("--reproj-filter-px", type=float, default=5.0,
+                        help="Discard tracks whose initial reprojection error exceeds this "
+                             "in any camera (only applied when /tf priors present). 0=disabled.")
+    parser.add_argument("--max-landmark-dist", type=float, default=0.0,
+                        help="Discard triangulated landmarks farther than this (metres) from "
+                             "every observing camera. Prevents near-parallel-ray singularities. "
+                             "0=disabled.")
+    parser.add_argument("--min-parallax-deg", type=float, default=1.0,
+                        help="Discard landmarks where the max viewing angle across all camera "
+                             "pairs is below this (degrees). Prevents singular Jacobians from "
+                             "low-baseline triangulations. 0=disabled.")
+    parser.add_argument("--huber-loss", action="store_true",
+                        help="Use a Huber robust noise model for projection factors. "
+                             "Downweights observations with reprojection error > pixel-noise-px.")
+    parser.add_argument("--ransac-threshold", type=float, default=2.0,
+                        help="RANSAC inlier threshold in pixels for F-matrix geometric "
+                             "filtering (USAC_MAGSAC). 0=disabled.")
     args = parser.parse_args()
 
     print(f"Input:  {args.input}")
@@ -146,7 +167,11 @@ def main() -> None:
         pose_noise_rad=args.pose_noise_rad,
         pixel_noise_px=args.pixel_noise_px,
         max_tracks=args.max_tracks,
-        max_reproj_error_px=0.0,
+        max_reproj_error_px=args.reproj_filter_px,
+        max_landmark_dist_m=args.max_landmark_dist,
+        min_parallax_deg=args.min_parallax_deg,
+        huber_loss=args.huber_loss,
+        ransac_threshold=args.ransac_threshold,
     )
 
     images = [(t_ns, bytes(msg.data)) for t_ns, msg in raw_images]
@@ -161,15 +186,46 @@ def main() -> None:
         else:
             print(f"Warning: only {len(matched)} /tf poses matched images; falling back to E-matrix init")
 
+    # Load cached SIFT features if the topic exists in the input MCAP
+    preloaded_features = None
+    if SIFT_FEATURES_TOPIC in topics:
+        print(f"Loading cached SIFT features from {SIFT_FEATURES_TOPIC}...", flush=True)
+        preloaded_features = load_sift_features(args.input, topic=SIFT_FEATURES_TOPIC)
+        print(f"  Loaded features for {len(preloaded_features)} images", flush=True)
+
     t_start = time.time()
-    result = optimize_poses(images, cal, opts, initial_poses=initial_poses)
+    result = optimize_poses(images, cal, opts, initial_poses=initial_poses,
+                            preloaded_features=preloaded_features)
     elapsed = time.time() - t_start
 
     opt_poses     = result["poses"]
     initial_poses = result["initial_poses"]
     keypoints     = result["keypoints"]
+    descriptors   = result["descriptors"]
     triangulated  = result["triangulated"]
     print(f"\nSfM complete in {elapsed:.1f}s  ({result['n_tracks']} tracks)")
+
+    # APE vs GT when ground-truth poses were provided from the input MCAP
+    ape_by_ts: dict[int, tuple[float, float]] = {}   # t_ns → (translation_m, rotation_deg)
+    if tf_msgs:
+        for t_ns, _ in raw_images:
+            if t_ns not in initial_poses or t_ns not in opt_poses:
+                continue
+            gt  = initial_poses[t_ns]
+            est = opt_poses[t_ns]
+            t_err = float(np.linalg.norm(gt.translation() - est.translation()))
+            R_rel = gt.rotation().matrix().T @ est.rotation().matrix()
+            cos_a = float(np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0))
+            r_err = float(np.degrees(np.arccos(cos_a)))
+            ape_by_ts[t_ns] = (t_err, r_err)
+        if ape_by_ts:
+            t_errs = [v[0] for v in ape_by_ts.values()]
+            r_errs = [v[1] for v in ape_by_ts.values()]
+            print(f"\nAPE vs GT ({len(ape_by_ts)} cameras):")
+            print(f"  Translation (m):  mean={np.mean(t_errs):.4f}  "
+                  f"median={np.median(t_errs):.4f}  max={np.max(t_errs):.4f}")
+            print(f"  Rotation (deg):   mean={np.mean(r_errs):.4f}  "
+                  f"median={np.median(r_errs):.4f}  max={np.max(r_errs):.4f}")
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with McapWriter(args.output) as writer:
@@ -214,6 +270,19 @@ def main() -> None:
             r=0.2, g=1.0, b=0.3,
             cal=cal,
         )
+
+        # Per-frame APE (only present when GT poses were in the input MCAP)
+        _ape_fields = {"translation_m": "number", "rotation_deg": "number"}
+        for t_ns, (t_err, r_err) in ape_by_ts.items():
+            writer.write_json(APE_TOPIC, _ape_fields,
+                              {"translation_m": t_err, "rotation_deg": r_err}, t_ns)
+
+        # SIFT features — write for downstream reuse (cached from input or freshly detected)
+        for t_ns, _ in raw_images:
+            if t_ns in keypoints and t_ns in descriptors:
+                writer.write_sift_features(
+                    SIFT_FEATURES_TOPIC, keypoints[t_ns], descriptors[t_ns], t_ns
+                )
 
     size_mb = Path(args.output).stat().st_size / 1e6
     print(f"Wrote {args.output}  ({size_mb:.1f} MB)")

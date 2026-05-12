@@ -21,70 +21,95 @@ mcap-protobuf-support = ">=0.5"
 autocal = { path = ".", editable = true }
 
 # ---------------------------------------------------------------------------
-# ETH3D pipes — undistorted (PINHOLE, no distortion)
+# ETH3D pipes — undistorted PINHOLE
 # ---------------------------------------------------------------------------
 
-[tasks.pipe-undistort-prepare]
-cmd = ["python", "tools/download_eth3d_pipes.py"]
-# Downloads pipes_dslr_undistorted.7z, extracts, converts to data/eth3d_pipes.mcap
+[tasks.eth3d-pipes-prepare]
+cmd = ["python", "tools/prepare_dataset.py", "eth3d-pipes"]
 
-[tasks.pipe-undistort-sfm]
-cmd = ["python", "tools/run_sfm.py",
+[tasks.eth3d-pipes-sfm]
+cmd = ["python", "pipelines/sfm.py",
        "data/eth3d_pipes.mcap",
        "data/eth3d_pipes_sfm.mcap"]
-depends-on = ["pipe-undistort-prepare"]
+depends-on = ["eth3d-pipes-prepare"]
 
-[tasks.pipe-undistort-calibrate]
-cmd = ["python", "tools/run_calibrate.py",
+[tasks.eth3d-pipes-calibrate]
+cmd = ["python", "pipelines/calibrate.py",
        "data/eth3d_pipes_sfm.mcap",
        "data/eth3d_pipes_calibrated.mcap"]
-depends-on = ["pipe-undistort-sfm"]
+depends-on = ["eth3d-pipes-sfm"]
 
 # ---------------------------------------------------------------------------
-# ETH3D pipes — raw DSLR (THIN_PRISM_FISHEYE / Kannala-Brandt)
+# ETH3D pipes — raw DSLR (THIN_PRISM_FISHEYE / equidistant)
 # ---------------------------------------------------------------------------
 
-[tasks.pipes-download-raw]
-cmd = ["python", "tools/download_eth3d_pipes_raw.py"]
-# Downloads pipes_dslr_jpg.7z and extracts to data/eth3d_pipes/
+[tasks.eth3d-pipes-raw-prepare]
+cmd = ["python", "tools/prepare_dataset.py", "eth3d-pipes-raw"]
 
-[tasks.pipe-raw-prepare]
-cmd = ["python", "tools/convert_eth3d_pipes_raw.py"]
-depends-on = ["pipes-download-raw"]
-# Converts to data/eth3d_pipes_raw.mcap with equidistant calibration
-
-[tasks.pipe-raw-sfm]
-cmd = ["python", "tools/run_sfm.py",
+[tasks.eth3d-pipes-raw-sfm]
+cmd = ["python", "pipelines/sfm.py",
        "data/eth3d_pipes_raw.mcap",
        "data/eth3d_pipes_raw_sfm.mcap"]
-depends-on = ["pipe-raw-prepare"]
+depends-on = ["eth3d-pipes-raw-prepare"]
 
-[tasks.pipe-raw-calibrate]
-cmd = ["python", "tools/run_calibrate.py",
+[tasks.eth3d-pipes-raw-calibrate]
+cmd = ["python", "pipelines/calibrate.py",
        "data/eth3d_pipes_raw_sfm.mcap",
        "data/eth3d_pipes_raw_calibrated.mcap"]
-depends-on = ["pipe-raw-sfm"]
+depends-on = ["eth3d-pipes-raw-sfm"]
+
+# ---------------------------------------------------------------------------
+# ETH3D exhibition hall — raw DSLR (Kannala-Brandt fisheye)
+# ---------------------------------------------------------------------------
+
+[tasks.eth3d-exhibition-hall-prepare]
+cmd = ["python", "tools/prepare_dataset.py", "eth3d-exhibition-hall"]
+
+[tasks.eth3d-exhibition-hall-sfm]
+cmd = ["python", "pipelines/sfm.py",
+       "data/eth3d_exhibition_hall.mcap",
+       "data/eth3d_exhibition_hall_sfm.mcap"]
+depends-on = ["eth3d-exhibition-hall-prepare"]
+
+[tasks.eth3d-exhibition-hall-calibrate]
+cmd = ["python", "pipelines/calibrate.py",
+       "data/eth3d_exhibition_hall_sfm.mcap",
+       "data/eth3d_exhibition_hall_calibrated.mcap"]
+depends-on = ["eth3d-exhibition-hall-sfm"]
+
+[tasks.eth3d-exhibition-hall-perturb]
+cmd = ["python", "tools/perturb_mcap.py",
+       "data/eth3d_exhibition_hall.mcap",
+       "data/eth3d_exhibition_hall_noisy.mcap",
+       "--pose-noise-m", "0.1",
+       "--pose-noise-rad", "0.05"]
+depends-on = ["eth3d-exhibition-hall-prepare"]
+
+[tasks.eth3d-exhibition-hall-noisy-sfm]
+cmd = ["python", "pipelines/sfm.py",
+       "data/eth3d_exhibition_hall_noisy.mcap",
+       "data/eth3d_exhibition_hall_noisy_sfm.mcap",
+       "--reproj-filter-px", "0",
+       "--max-landmark-dist", "100",
+       "--min-parallax-deg", "2",
+       "--huber-loss"]
+depends-on = ["eth3d-exhibition-hall-perturb"]
 
 # ---------------------------------------------------------------------------
 # Caliterra — UAV nadir survey (Canon SX260 HS, GPS)
 # ---------------------------------------------------------------------------
 
-[tasks.caliterra-download]
-cmd = ["python", "tools/download_dataset.py"]
-
 [tasks.caliterra-prepare]
-cmd = ["python", "tools/convert_to_mcap.py"]
-depends-on = ["caliterra-download"]
-# Converts to data/caliterra.mcap with EXIF calibration + GPS
+cmd = ["python", "tools/prepare_dataset.py", "caliterra"]
 
 [tasks.caliterra-sfm]
-cmd = ["python", "tools/run_sfm.py",
+cmd = ["python", "pipelines/sfm.py",
        "data/caliterra.mcap",
        "data/caliterra_sfm.mcap"]
 depends-on = ["caliterra-prepare"]
 
 [tasks.caliterra-calibrate]
-cmd = ["python", "tools/run_calibrate.py",
+cmd = ["python", "pipelines/calibrate.py",
        "data/caliterra_sfm.mcap",
        "data/caliterra_calibrated.mcap"]
 depends-on = ["caliterra-sfm"]

@@ -119,6 +119,50 @@ def match_sift(
 
 
 # ---------------------------------------------------------------------------
+# Geometric verification
+# ---------------------------------------------------------------------------
+
+def filter_matches_ransac(
+    kps_a: np.ndarray,
+    kps_b: np.ndarray,
+    matches: list[tuple[int, int]],
+    ransac_threshold: float = 2.0,
+    min_inliers: int = 15,
+) -> list[tuple[int, int]]:
+    """Filter matches using RANSAC + fundamental matrix (USAC_MAGSAC).
+
+    Args:
+        kps_a, kps_b:      Undistorted keypoints for images A and B (shape-(N,2)
+                           float32).  Must be undistorted so epipolar geometry
+                           is correct.
+        matches:           Initial matches from the ratio test.
+        ransac_threshold:  Inlier reprojection threshold in pixels.
+        min_inliers:       Discard the pair if fewer inliers survive.
+
+    Returns:
+        Inlier matches, or an empty list if the pair fails.
+    """
+    if len(matches) < 8:
+        return []
+
+    pts_a = kps_a[[i for i, _ in matches]].astype(np.float64)
+    pts_b = kps_b[[j for _, j in matches]].astype(np.float64)
+
+    _, mask = cv2.findFundamentalMat(
+        pts_a, pts_b,
+        method=cv2.USAC_MAGSAC,
+        ransacReprojThreshold=ransac_threshold,
+        confidence=0.999,
+        maxIters=10000,
+    )
+    if mask is None:
+        return []
+
+    inliers = [m for m, ok in zip(matches, mask.ravel()) if ok]
+    return inliers if len(inliers) >= min_inliers else []
+
+
+# ---------------------------------------------------------------------------
 # Track building
 # ---------------------------------------------------------------------------
 

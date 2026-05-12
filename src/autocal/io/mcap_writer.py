@@ -29,12 +29,26 @@ Schema encoding:
 
 from __future__ import annotations
 
+import base64
+import json
+import zlib
 from pathlib import Path
 from typing import Any
 
 import foxglove
+import numpy as np
 from google.protobuf import descriptor_pb2
 from google.protobuf.timestamp_pb2 import Timestamp
+
+
+def _encode_array(arr: np.ndarray) -> str:
+    """Compress a float32 numpy array to a base64 string (zlib level-1)."""
+    return base64.b64encode(
+        zlib.compress(arr.astype(np.float32).tobytes(), level=1)
+    ).decode()
+
+
+_SIFT_SCHEMA_FIELDS = {"n": "integer", "kps": "string", "desc": "string"}
 
 
 def make_proto_schema(msg_class: type) -> foxglove.Schema:
@@ -123,6 +137,28 @@ class McapWriter:
                 message_encoding="protobuf",
             )
         self._channels[topic].log(msg.SerializeToString(), log_time=t_ns)
+
+    def write_sift_features(
+        self,
+        topic: str,
+        kps: np.ndarray,
+        descs: np.ndarray,
+        t_ns: int,
+    ) -> None:
+        """Write SIFT keypoints and descriptors as a compressed JSON message.
+
+        Args:
+            topic:  MCAP topic (e.g. "/camera/sift_features").
+            kps:    shape-(N,2) float32 pixel coordinates.
+            descs:  shape-(N,128) float32 SIFT descriptors.
+            t_ns:   Log timestamp in Unix nanoseconds.
+        """
+        self.write_json(
+            topic,
+            _SIFT_SCHEMA_FIELDS,
+            {"n": len(kps), "kps": _encode_array(kps), "desc": _encode_array(descs)},
+            t_ns,
+        )
 
     def write_json(self, topic: str, fields: dict[str, str], msg: dict, t_ns: int) -> None:
         """Write a JSON-encoded message — use for numeric values Foxglove can plot.

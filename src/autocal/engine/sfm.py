@@ -15,12 +15,13 @@ Pipeline
      - If initial_poses provided: use them directly (with prior factors in the graph).
      - If not: chain relative poses from the essential matrix between successive pairs.
        Frame 0 is placed at the origin. Translation is unit-scale only.
-5. Triangulate track 3D positions.
+5. Triangulate track 3D positions using gtsam.triangulatePoint3 (multi-view, nonlinear
+   refinement) with distorted pixel observations.
 6. Build GTSAM factor graph:
      - PriorFactorPose3 for each camera that has an initial pose.
      - GenericProjectionFactorCal3DS2 per (camera, landmark, 2D observation)
        with calibration as a fixed constant (not a graph variable).
-7. Optimise with Levenberg–Marquardt.
+7. Optimise with Dogleg (trust-region, more robust than LM for large initial error).
 8. Return optimised poses and track data.
 """
 
@@ -35,8 +36,8 @@ from autocal.engine.features import (
     Track,
     build_tracks,
     detect_sift,
+    filter_matches_ransac,
     match_sift,
-    triangulate_tracks,
 )
 
 
@@ -58,16 +59,35 @@ class SfmOptions:
                              any camera.  Removes false SIFT matches before the
                              graph is built.  Only applied when initial_poses is
                              provided.  0 = disabled.
+        max_landmark_dist_m: Discard triangulated landmarks farther than this
+                             from every observing camera.  Eliminates near-
+                             degenerate points (nearly-parallel rays) that cause
+                             singular Jacobians in the factor graph.  0 = disabled.
+        min_parallax_deg:    Discard landmarks where the maximum viewing angle
+                             between any two cameras is below this threshold.
+                             Enforces a minimum triangulation baseline.  Small
+                             angles produce poorly-conditioned Jacobians even
+                             when the point is within the distance limit.
+                             0 = disabled.
+        huber_loss:          Use a Huber robust noise model for projection
+                             factors instead of Gaussian.  Downweights
+                             observations with large reprojection errors (> k
+                             pixels where k = pixel_noise_px) so surviving
+                             outlier matches don't dominate the solution.
     """
     sift_features: int = 0
     match_ratio: float = 0.75
     min_matches: int = 8
-    lm_iterations: int = 100
+    lm_iterations: int = 200
     pose_noise_m: float = 1.0
     pose_noise_rad: float = 0.1
     pixel_noise_px: float = 1.5
     max_tracks: int = 2000
     max_reproj_error_px: float = 0.0
+    max_landmark_dist_m: float = 0.0
+    min_parallax_deg: float = 1.0
+    huber_loss: bool = False
+    ransac_threshold: float = 2.0
 
 
 def optimize_poses(
@@ -75,41 +95,57 @@ def optimize_poses(
     calibration: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
     opts: SfmOptions,
     initial_poses: dict[int, gtsam.Pose3] | None = None,
+    preloaded_features: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict:
     """Solve camera poses with calibration held fixed.
 
     Args:
-        images:         Ordered list of (img_id, jpeg_bytes).  Sequential
-                        matching is done between adjacent entries.
-        calibration:    Fixed camera intrinsics.  Not a graph variable.
-        opts:           Tuning options.
-        initial_poses:  If provided, Pose3(R_wc, t) per img_id used as
-                        initial values and prior factors.  If None, poses are
-                        initialised via essential-matrix chaining and no prior
-                        is added (frame 0 is fixed as the gauge).
+        images:             Ordered list of (img_id, jpeg_bytes).  Image bytes
+                            are used for SIFT detection only when
+                            preloaded_features is None.
+        calibration:        Fixed camera intrinsics.  Not a graph variable.
+        opts:               Tuning options.
+        initial_poses:      If provided, Pose3(R_wc, t) per img_id used as
+                            initial values and prior factors.
+        preloaded_features: If provided, {img_id: (kps, descs)} loaded from a
+                            cached MCAP topic.  Detection is skipped.
+                            Features are truncated to opts.sift_features if set.
 
     Returns:
         Dict with keys:
           "poses"        — dict[int, Pose3] optimised poses (R_wc, t)
           "n_tracks"     — number of triangulated tracks used
           "keypoints"    — dict[int, np.ndarray] SIFT keypoints per image
+          "descriptors"  — dict[int, np.ndarray] SIFT descriptors per image
           "triangulated" — list[Track] with point3d set
     """
     img_ids = [img_id for img_id, _ in images]
     id_to_idx: dict[int, int] = {img_id: i for i, img_id in enumerate(img_ids)}
 
     # ------------------------------------------------------------------ #
-    # Feature detection
+    # Feature detection (or load from cache)
     # ------------------------------------------------------------------ #
-    print(f"Detecting features in {len(images)} images...", flush=True)
     keypoints: dict[int, np.ndarray] = {}
     descriptors: dict[int, np.ndarray] = {}
-    for i, (img_id, img_bytes) in enumerate(images):
-        kps, descs = detect_sift(img_bytes, n_features=opts.sift_features)
-        keypoints[img_id] = kps
-        descriptors[img_id] = descs
-        if (i + 1) % 10 == 0 or i + 1 == len(images):
-            print(f"  {i+1}/{len(images)}", flush=True)
+    if preloaded_features is not None:
+        print(f"Loading cached features for {len(images)} images...", flush=True)
+        for img_id, _ in images:
+            if img_id not in preloaded_features:
+                continue
+            kps, descs = preloaded_features[img_id]
+            if opts.sift_features > 0 and len(kps) > opts.sift_features:
+                kps = kps[:opts.sift_features]
+                descs = descs[:opts.sift_features]
+            keypoints[img_id] = kps
+            descriptors[img_id] = descs
+    else:
+        print(f"Detecting features in {len(images)} images...", flush=True)
+        for i, (img_id, img_bytes) in enumerate(images):
+            kps, descs = detect_sift(img_bytes, n_features=opts.sift_features)
+            keypoints[img_id] = kps
+            descriptors[img_id] = descs
+            if (i + 1) % 10 == 0 or i + 1 == len(images):
+                print(f"  {i+1}/{len(images)}", flush=True)
 
     # ------------------------------------------------------------------ #
     # Sequential matching
@@ -122,18 +158,12 @@ def optimize_poses(
         if len(m) >= opts.min_matches:
             matches_per_pair[(id_a, id_b)] = m
     print(
-        f"  {len(matches_per_pair)}/{len(img_ids)-1} pairs passed "
-        f"min_matches={opts.min_matches}",
+        f"  {len(matches_per_pair)}/{len(img_ids)-1} pairs passed ratio test",
         flush=True,
     )
 
     # ------------------------------------------------------------------ #
-    # Track building
-    # ------------------------------------------------------------------ #
-    tracks = build_tracks(matches_per_pair)
-
-    # ------------------------------------------------------------------ #
-    # Undistort keypoints for geometry (triangulation + essential matrix)
+    # Undistort keypoints for geometry (RANSAC + essential matrix)
     # ------------------------------------------------------------------ #
     _fisheye = isinstance(calibration, gtsam.Cal3Fisheye)
     K = _cal_to_K(calibration)
@@ -152,6 +182,28 @@ def optimize_poses(
         keypoints_for_geo = keypoints
 
     # ------------------------------------------------------------------ #
+    # RANSAC geometric filtering
+    # ------------------------------------------------------------------ #
+    if opts.ransac_threshold > 0:
+        n_before = sum(len(m) for m in matches_per_pair.values())
+        filtered: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        for (id_a, id_b), m in matches_per_pair.items():
+            inliers = filter_matches_ransac(
+                keypoints_for_geo[id_a], keypoints_for_geo[id_b], m,
+                ransac_threshold=opts.ransac_threshold,
+                min_inliers=opts.min_matches,
+            )
+            if inliers:
+                filtered[(id_a, id_b)] = inliers
+        matches_per_pair = filtered
+        n_after = sum(len(m) for m in matches_per_pair.values())
+        print(
+            f"  RANSAC: {len(matches_per_pair)}/{len(img_ids)-1} pairs kept  "
+            f"({n_before} → {n_after} matches)",
+            flush=True,
+        )
+
+    # ------------------------------------------------------------------ #
     # Initial poses
     # ------------------------------------------------------------------ #
     has_priors = initial_poses is not None
@@ -163,9 +215,13 @@ def optimize_poses(
         )
 
     # ------------------------------------------------------------------ #
-    # Triangulate
+    # Triangulate — GTSAM multi-view with nonlinear refinement
+    # Uses distorted pixel observations so the calibration model is applied
+    # correctly; all visible cameras contribute (not just the first 2).
     # ------------------------------------------------------------------ #
-    triangulate_tracks(tracks, keypoints_for_geo, K, poses)
+    _triangulate_gtsam(tracks, keypoints, calibration, poses, id_to_idx,
+                       max_dist=opts.max_landmark_dist_m,
+                       min_parallax_deg=opts.min_parallax_deg)
     good = [
         t for t in tracks
         if t.point3d is not None and _all_positive_depth(t.point3d, t.observations, poses)
@@ -207,7 +263,14 @@ def optimize_poses(
         ]))
         graph.add(gtsam.PriorFactorPose3(X(0), poses[img_ids[0]], fixed_noise))
 
-    pixel_noise = gtsam.noiseModel.Isotropic.Sigma(2, opts.pixel_noise_px)
+    base_noise = gtsam.noiseModel.Isotropic.Sigma(2, opts.pixel_noise_px)
+    if opts.huber_loss:
+        pixel_noise = gtsam.noiseModel.Robust.Create(
+            gtsam.noiseModel.mEstimator.Huber.Create(opts.pixel_noise_px),
+            base_noise,
+        )
+    else:
+        pixel_noise = base_noise
     for j, track in enumerate(triangulated):
         initial_values.insert(P(j), gtsam.Point3(*track.point3d))
         for img_id, kp_idx in track.observations.items():
@@ -235,9 +298,9 @@ def optimize_poses(
         f"Optimising ({len(triangulated)} tracks, {len(poses)} cameras)...",
         flush=True,
     )
-    lm_params = gtsam.LevenbergMarquardtParams()
-    lm_params.setMaxIterations(opts.lm_iterations)
-    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, lm_params)
+    dogleg_params = gtsam.DoglegParams()
+    dogleg_params.setMaxIterations(opts.lm_iterations)
+    optimizer = gtsam.DoglegOptimizer(graph, initial_values, dogleg_params)
     result = optimizer.optimize()
     print(
         f"  Error: {graph.error(initial_values):.3e} → {graph.error(result):.3e}",
@@ -254,6 +317,7 @@ def optimize_poses(
         "initial_poses": poses,   # pre-optimisation (E-matrix chain or provided priors)
         "n_tracks": len(triangulated),
         "keypoints": keypoints,
+        "descriptors": descriptors,
         "triangulated": triangulated,
     }
 
@@ -261,6 +325,77 @@ def optimize_poses(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _triangulate_gtsam(
+    tracks: list[Track],
+    keypoints: dict[int, np.ndarray],
+    calibration: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
+    poses: dict[int, gtsam.Pose3],
+    id_to_idx: dict[int, int],
+    max_dist: float = 0.0,
+    min_parallax_deg: float = 0.0,
+) -> None:
+    """Triangulate tracks in-place using gtsam.triangulatePoint3.
+
+    Uses all visible cameras (not just 2) and applies nonlinear refinement,
+    which is substantially more accurate than 2-view DLT.  Observations are
+    distorted pixels — the calibration model handles projection internally.
+
+    max_dist > 0 discards points farther than that from every observing camera.
+    min_parallax_deg > 0 requires the maximum viewing angle across all camera
+    pairs to exceed this threshold — small angles produce near-zero Jacobians
+    that make the landmark information matrix singular.
+    """
+    for track in tracks:
+        visible = [
+            (img_id, kp_idx)
+            for img_id, kp_idx in track.observations.items()
+            if img_id in poses and img_id in id_to_idx
+        ]
+        if len(visible) < 2:
+            continue
+
+        pose_vec = gtsam.Pose3Vector()
+        meas_vec = gtsam.Point2Vector()
+        for img_id, kp_idx in visible:
+            pose_vec.append(poses[img_id])
+            kp = keypoints[img_id][kp_idx]
+            meas_vec.append(gtsam.Point2(float(kp[0]), float(kp[1])))
+
+        try:
+            pt = gtsam.triangulatePoint3(pose_vec, calibration, meas_vec,
+                                         rank_tol=1e-9, optimize=True)
+            pt_np = np.array([float(pt[0]), float(pt[1]), float(pt[2])])
+        except Exception:
+            track.point3d = None
+            continue
+
+        if max_dist > 0.0:
+            min_cam_dist = min(
+                np.linalg.norm(pt_np - poses[img_id].translation())
+                for img_id, _ in visible
+            )
+            if min_cam_dist > max_dist:
+                track.point3d = None
+                continue
+
+        if min_parallax_deg > 0.0:
+            cam_positions = np.array([poses[img_id].translation() for img_id, _ in visible])
+            rays = pt_np - cam_positions                                   # (N, 3)
+            norms = np.linalg.norm(rays, axis=1, keepdims=True)
+            if np.any(norms < 1e-10):
+                track.point3d = None
+                continue
+            rays_norm = rays / norms
+            cos_mat = rays_norm @ rays_norm.T                              # (N, N)
+            np.fill_diagonal(cos_mat, 1.0)
+            max_angle_deg = float(np.degrees(np.arccos(np.clip(cos_mat.min(), -1.0, 1.0))))
+            if max_angle_deg < min_parallax_deg:
+                track.point3d = None
+                continue
+
+        track.point3d = pt_np
+
 
 def _cal_to_K(cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye) -> np.ndarray:
     return np.array([
