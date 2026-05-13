@@ -30,7 +30,6 @@ from __future__ import annotations
 import re as _re
 from dataclasses import dataclass
 
-import cv2
 import gtsam
 import numpy as np
 
@@ -39,6 +38,7 @@ from autocal.engine.features import (
     all_positive_depth,
     build_tracks,
     cal_to_K,
+    chain_essential_matrix,
     detect_sift,
     filter_by_reproj,
     filter_matches_ransac,
@@ -165,7 +165,7 @@ def optimize_poses(
     if has_priors:
         poses: dict[int, gtsam.Pose3] = dict(initial_poses)
     else:
-        poses = _chain_essential_matrix(img_ids, keypoints_for_geo, matches_per_pair, K)
+        poses = chain_essential_matrix(img_ids, keypoints_for_geo, matches_per_pair, K)
 
     # ------------------------------------------------------------------ #
     # Triangulate — GTSAM multi-view with nonlinear refinement
@@ -347,53 +347,3 @@ def _build_and_optimize(
     raise RuntimeError("_build_and_optimize: max retries exceeded")
 
 
-def _chain_essential_matrix(
-    img_ids: list[int],
-    keypoints: dict[int, np.ndarray],
-    matches_per_pair: dict[tuple[int, int], list[tuple[int, int]]],
-    K: np.ndarray,
-) -> dict[int, gtsam.Pose3]:
-    """Initialise poses by chaining essential-matrix relative poses.
-
-    Frame 0 is placed at the origin with optical axis along world X+.
-    Translation is unit-scale (GTSAM resolves scale from feature tracks).
-    keypoints should be undistorted (caller's responsibility).
-    """
-    R_wc_0 = gtsam.Rot3(np.array([
-        [0.0,  0.0, 1.0],
-        [1.0,  0.0, 0.0],
-        [0.0, -1.0, 0.0],
-    ]))
-    poses: dict[int, gtsam.Pose3] = {
-        img_ids[0]: gtsam.Pose3(R_wc_0, gtsam.Point3(0.0, 0.0, 0.0))
-    }
-
-    for k in range(len(img_ids) - 1):
-        id_a, id_b = img_ids[k], img_ids[k + 1]
-        pose_a = poses[id_a]
-
-        if (id_a, id_b) not in matches_per_pair or len(matches_per_pair[(id_a, id_b)]) < 5:
-            poses[id_b] = pose_a
-            continue
-
-        matches = matches_per_pair[(id_a, id_b)]
-        pts_a = keypoints[id_a][[i for i, _ in matches]].astype(np.float64)
-        pts_b = keypoints[id_b][[j for _, j in matches]].astype(np.float64)
-
-        E, mask = cv2.findEssentialMat(
-            pts_a, pts_b, K, method=cv2.RANSAC, prob=0.999, threshold=1.0,
-        )
-        if E is None:
-            poses[id_b] = pose_a
-            continue
-
-        _, R_rel, t_rel, _ = cv2.recoverPose(E, pts_a, pts_b, K, mask=mask)
-
-        # cv2.recoverPose: P_camB = R_rel @ P_camA + t_rel
-        # R_wc_B = R_wc_A @ R_rel^T  (t is unit-scale)
-        R_wc_a = pose_a.rotation().matrix()
-        R_wc_b = gtsam.Rot3(R_wc_a @ R_rel.T)
-        t_b = pose_a.translation() - R_wc_b.matrix() @ t_rel.flatten()
-        poses[id_b] = gtsam.Pose3(R_wc_b, gtsam.Point3(*t_b))
-
-    return poses
