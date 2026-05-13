@@ -68,6 +68,7 @@ class SfmOptions:
     classify_pairs: bool = True
     min_track_length: int = 3
     match_window: int = 3
+    post_reproj_error_px: float = 5.0
 
 
 def optimize_poses(
@@ -261,6 +262,38 @@ def optimize_poses(
         img_id: result.atPose3(X(idx))
         for img_id, idx in id_to_idx.items()
     }
+
+    # ------------------------------------------------------------------ #
+    # Post-optimisation outlier rejection + re-optimise
+    # ------------------------------------------------------------------ #
+    if opts.post_reproj_error_px > 0:
+        clean = filter_by_reproj(
+            triangulated, keypoints, opt_poses, calibration,
+            opts.post_reproj_error_px,
+        )
+        n_rejected = len(triangulated) - len(clean)
+        if n_rejected > 0 and len(clean) > 0:
+            print(
+                f"  Post-opt: {n_rejected} tracks rejected "
+                f"(reproj>{opts.post_reproj_error_px:.1f}px), "
+                f"re-optimising on {len(clean)}...",
+                flush=True,
+            )
+            result, graph, initial_values, _ = _build_and_optimize(
+                clean, opt_poses, id_to_idx, img_ids, keypoints,
+                calibration, opts, has_priors,
+                initial_poses if has_priors else None,
+                _fisheye,
+            )
+            print(
+                f"  Error: {graph.error(initial_values):.3e} → {graph.error(result):.3e}",
+                flush=True,
+            )
+            opt_poses = {
+                img_id: result.atPose3(X(idx))
+                for img_id, idx in id_to_idx.items()
+            }
+            triangulated = clean
 
     return {
         "poses":         opt_poses,

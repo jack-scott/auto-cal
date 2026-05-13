@@ -92,9 +92,10 @@ _DEFAULTS: dict = {
     "min_parallax_deg": 1.0,
     "huber_loss":       False,
     "ransac_threshold":  2.0,
-    "min_track_length":  3,
-    "match_window":      3,
-    "ignore_poses":      False,
+    "min_track_length":    3,
+    "match_window":        3,
+    "post_reproj_error_px": 5.0,
+    "ignore_poses":        False,
 }
 
 # Preset parameter overrides. Keys match the _DEFAULTS keys above.
@@ -186,6 +187,9 @@ def main() -> None:
     parser.add_argument("--match-window", type=int, default=None,
                         help="Match each frame against this many following frames (default 3). "
                              "1 = sequential only.")
+    parser.add_argument("--post-reproj-px", type=float, default=None,
+                        help="After optimisation, remove tracks whose max reprojection error "
+                             "exceeds this threshold and re-optimise. Default 2.0px. 0=disabled.")
     args = parser.parse_args()
 
     # Apply preset first, then explicit CLI flags override, then fall back to _DEFAULTS.
@@ -205,10 +209,11 @@ def main() -> None:
         "max_landmark_dist": args.max_landmark_dist,
         "min_parallax_deg": args.min_parallax_deg,
         "huber_loss":       args.huber_loss if args.huber_loss else None,
-        "ransac_threshold":  args.ransac_threshold,
-        "min_track_length":  args.min_track_length,
-        "match_window":      args.match_window,
-        "ignore_poses":      True if args.ignore_poses else None,
+        "ransac_threshold":     args.ransac_threshold,
+        "min_track_length":     args.min_track_length,
+        "match_window":         args.match_window,
+        "post_reproj_error_px": args.post_reproj_px,
+        "ignore_poses":         True if args.ignore_poses else None,
     }
     for k, v in cli_overrides.items():
         if v is not None:
@@ -277,6 +282,7 @@ def main() -> None:
         ransac_threshold=effective["ransac_threshold"],
         min_track_length=effective["min_track_length"],
         match_window=effective["match_window"],
+        post_reproj_error_px=effective["post_reproj_error_px"],
     )
 
     images = [(t_ns, bytes(msg.data)) for t_ns, msg in raw_images]

@@ -228,8 +228,11 @@ These are ordered by impact and dependency:
    filter reduces track count too aggressively and hurts APE until covisibility
    window matching (item 4) is added.
 
-3. **Post-optimisation outlier rejection** (§6) — moderate complexity.
-   Needs `filter_by_reproj` called after optimisation with optimised poses.
+3. **Post-optimisation outlier rejection** (§6) — ✓ COMPLETED
+   `SfmOptions.post_reproj_error_px: float = 5.0`, `--post-reproj-px` CLI flag.
+   5 tests in `tests/test_post_reproj.py`.
+   Guard added for empty clean list (skip re-optimisation rather than crash).
+   Threshold still needs noise-adaptive tuning (5px cuts too many at medium noise).
 
 4. **Covisibility window matching** (§2) — ✓ COMPLETED
    `SfmOptions.match_window: int = 3`, `--match-window` CLI flag.

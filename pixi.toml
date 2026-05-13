@@ -104,7 +104,8 @@ cmd = ["python", "pipelines/sfm.py",
        "--pose-noise-m", "0.005",
        "--pose-noise-rad", "0.002",
        "--min-parallax-deg", "2",
-       "--reproj-filter-px", "8"]
+       "--reproj-filter-px", "8",
+       "--post-reproj-px", "0"]
 depends-on = ["eth3d-exhibition-hall-noise-easy-perturb"]
 
 # medium — σ_t > static-pair baseline; classifier falls back to H/E test
@@ -123,7 +124,8 @@ cmd = ["python", "pipelines/sfm.py",
        "--preset", "medium",
        "--pose-noise-m", "0.02",
        "--pose-noise-rad", "0.01",
-       "--min-parallax-deg", "2"]
+       "--min-parallax-deg", "2",
+       "--post-reproj-px", "0"]
 depends-on = ["eth3d-exhibition-hall-noise-medium-perturb"]
 
 # hard — existing noisy level; kept for backward compatibility
