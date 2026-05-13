@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
+import gtsam
 import numpy as np
 
 from autocal.io.mcap_reader import register_message
@@ -381,3 +382,248 @@ def draw_matches(
                           flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
     _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return bytes(buf)
+
+
+# ---------------------------------------------------------------------------
+# Geometry utilities (GTSAM-aware)
+# ---------------------------------------------------------------------------
+
+def cal_to_K(cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye) -> np.ndarray:
+    """Return the 3×3 intrinsic matrix K for a GTSAM calibration object."""
+    return np.array([
+        [cal.fx(), cal.skew(), cal.px()],
+        [0.0,      cal.fy(),   cal.py()],
+        [0.0,      0.0,        1.0     ],
+    ], dtype=np.float64)
+
+
+def undistort_keypoints(
+    keypoints: dict[Any, np.ndarray],
+    cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
+) -> dict[Any, np.ndarray]:
+    """Undistort pixel keypoints using the camera calibration model.
+
+    Returns the input dict unchanged when there is no distortion.
+
+    Args:
+        keypoints: {img_id: shape-(N,2) float32 pixel coordinates}.
+        cal:       gtsam.Cal3DS2 or gtsam.Cal3Fisheye.
+    """
+    k = np.array(cal.k(), dtype=np.float64)
+    if not np.any(k != 0.0):
+        return keypoints
+    K = cal_to_K(cal)
+    fisheye = isinstance(cal, gtsam.Cal3Fisheye)
+    result: dict[Any, np.ndarray] = {}
+    for img_id, kps in keypoints.items():
+        pts = kps.reshape(-1, 1, 2).astype(np.float64)
+        if fisheye:
+            D = k[:4].reshape(4, 1)
+            undist = cv2.fisheye.undistortPoints(pts, K, D, P=K)
+        else:
+            undist = cv2.undistortPoints(pts, K, k[:4], P=K)
+        result[img_id] = undist.reshape(-1, 2).astype(np.float32)
+    return result
+
+
+def all_positive_depth(
+    pt3d: np.ndarray,
+    observations: dict,
+    poses: dict,
+) -> bool:
+    """Return True if pt3d has positive depth in every observing camera.
+
+    Args:
+        pt3d:         shape-(3,) world-frame 3D point.
+        observations: {img_id: kp_idx} track observations.
+        poses:        {img_id: gtsam.Pose3(R_wc, t)}.
+    """
+    for img_id in observations:
+        if img_id not in poses:
+            continue
+        pose = poses[img_id]
+        R_cw = pose.rotation().matrix().T
+        z = (R_cw @ (pt3d - pose.translation()))[2]
+        if z <= 0:
+            return False
+    return True
+
+
+def filter_by_reproj(
+    tracks: list[Track],
+    keypoints: dict[Any, np.ndarray],
+    poses: dict,
+    cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
+    max_err_px: float,
+) -> list[Track]:
+    """Keep tracks whose max reprojection error across all observations is ≤ max_err_px.
+
+    Uses the full distortion model (Kannala-Brandt for fisheye,
+    Brown-Conrady for Cal3DS2).
+
+    Args:
+        tracks:     Track list with point3d set.
+        keypoints:  {img_id: shape-(N,2) float32 pixel coordinates}.
+        poses:      {img_id: gtsam.Pose3(R_wc, t)}.
+        cal:        gtsam.Cal3DS2 or gtsam.Cal3Fisheye.
+        max_err_px: Discard tracks with any observation error above this.
+    """
+    fisheye = isinstance(cal, gtsam.Cal3Fisheye)
+    fx, fy, cx, cy = cal.fx(), cal.fy(), cal.px(), cal.py()
+    k = np.array(cal.k(), dtype=np.float64)
+
+    def _max_err(track: Track) -> float:
+        max_e = 0.0
+        for img_id, kp_idx in track.observations.items():
+            if img_id not in poses or img_id not in keypoints:
+                continue
+            pose = poses[img_id]
+            R_cw = pose.rotation().matrix().T
+            pc = R_cw @ (track.point3d - pose.translation())
+            x, y, z = pc
+            if z <= 0:
+                return float("inf")
+            if fisheye:
+                r = np.sqrt(x*x + y*y)
+                if r < 1e-10:
+                    pu, pv = cx, cy
+                else:
+                    theta = np.arctan2(r, z)
+                    t2 = theta * theta
+                    rd = theta * (1 + k[0]*t2 + k[1]*t2**2 + k[2]*t2**3 + k[3]*t2**4)
+                    s = rd / r
+                    pu = fx * s * x + cx
+                    pv = fy * s * y + cy
+            else:
+                xn, yn = x / z, y / z
+                r2 = xn*xn + yn*yn
+                radial = 1.0 + k[0]*r2 + k[1]*r2*r2
+                pu = fx * (radial*xn + 2*k[2]*xn*yn + k[3]*(r2 + 2*xn*xn)) + cx
+                pv = fy * (radial*yn + k[2]*(r2 + 2*yn*yn) + 2*k[3]*xn*yn) + cy
+            obs_kp = keypoints[img_id][kp_idx]
+            e = np.hypot(pu - obs_kp[0], pv - obs_kp[1])
+            if e > max_e:
+                max_e = e
+        return max_e
+
+    return [t for t in tracks if _max_err(t) <= max_err_px]
+
+
+def max_reproj_error(
+    track: Track,
+    keypoints: dict[Any, np.ndarray],
+    poses: dict,
+    cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
+) -> float:
+    """Return the maximum reprojection error in pixels for a single track.
+
+    Uses the full distortion model.  Returns infinity if any camera sees
+    the point behind it.  Useful for diagnostics and per-track inspection.
+    """
+    fisheye = isinstance(cal, gtsam.Cal3Fisheye)
+    fx, fy, cx, cy = cal.fx(), cal.fy(), cal.px(), cal.py()
+    k = np.array(cal.k(), dtype=np.float64)
+    max_e = 0.0
+    for img_id, kp_idx in track.observations.items():
+        if img_id not in poses or img_id not in keypoints:
+            continue
+        pose = poses[img_id]
+        R_cw = pose.rotation().matrix().T
+        pc = R_cw @ (track.point3d - pose.translation())
+        x, y, z = pc
+        if z <= 0:
+            return float("inf")
+        if fisheye:
+            r = np.sqrt(x*x + y*y)
+            if r < 1e-10:
+                pu, pv = cx, cy
+            else:
+                theta = np.arctan2(r, z)
+                t2 = theta * theta
+                rd = theta * (1 + k[0]*t2 + k[1]*t2**2 + k[2]*t2**3 + k[3]*t2**4)
+                s = rd / r
+                pu = fx * s * x + cx
+                pv = fy * s * y + cy
+        else:
+            xn, yn = x / z, y / z
+            r2 = xn*xn + yn*yn
+            radial = 1.0 + k[0]*r2 + k[1]*r2*r2
+            pu = fx * (radial*xn + 2*k[2]*xn*yn + k[3]*(r2 + 2*xn*xn)) + cx
+            pv = fy * (radial*yn + k[2]*(r2 + 2*yn*yn) + 2*k[3]*xn*yn) + cy
+        obs_kp = keypoints[img_id][kp_idx]
+        e = np.hypot(pu - obs_kp[0], pv - obs_kp[1])
+        if e > max_e:
+            max_e = e
+    return max_e
+
+
+def triangulate_gtsam(
+    tracks: list[Track],
+    keypoints: dict[Any, np.ndarray],
+    cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
+    poses: dict,
+    max_dist: float = 0.0,
+    min_parallax_deg: float = 0.0,
+) -> None:
+    """Triangulate tracks in-place using GTSAM multi-view triangulation.
+
+    Uses all visible cameras and applies nonlinear refinement via
+    gtsam.triangulatePoint3.  Observations are distorted pixels — the
+    calibration model handles projection internally.
+
+    Args:
+        tracks:            Track list; point3d is set in-place on success.
+        keypoints:         {img_id: shape-(N,2) float32 distorted pixels}.
+        cal:               gtsam.Cal3DS2 or gtsam.Cal3Fisheye.
+        poses:             {img_id: gtsam.Pose3(R_wc, t)}.
+        max_dist:          Discard points farther than this from every
+                           observing camera (metres).  0 = disabled.
+        min_parallax_deg:  Discard points where the max viewing angle
+                           across all camera pairs is below this.  0 = disabled.
+    """
+    for track in tracks:
+        visible = [
+            (img_id, kp_idx)
+            for img_id, kp_idx in track.observations.items()
+            if img_id in poses
+        ]
+        if len(visible) < 2:
+            continue
+
+        pose_vec = gtsam.Pose3Vector()
+        meas_vec = gtsam.Point2Vector()
+        for img_id, kp_idx in visible:
+            pose_vec.append(poses[img_id])
+            kp = keypoints[img_id][kp_idx]
+            meas_vec.append(gtsam.Point2(float(kp[0]), float(kp[1])))
+
+        try:
+            pt = gtsam.triangulatePoint3(pose_vec, cal, meas_vec,
+                                         rank_tol=1e-9, optimize=True)
+            pt_np = np.array([float(pt[0]), float(pt[1]), float(pt[2])])
+        except Exception:
+            track.point3d = None
+            continue
+
+        if max_dist > 0.0:
+            if min(np.linalg.norm(pt_np - poses[img_id].translation())
+                   for img_id, _ in visible) > max_dist:
+                track.point3d = None
+                continue
+
+        if min_parallax_deg > 0.0:
+            cam_pos = np.array([poses[img_id].translation() for img_id, _ in visible])
+            rays = pt_np - cam_pos
+            norms = np.linalg.norm(rays, axis=1, keepdims=True)
+            if np.any(norms < 1e-10):
+                track.point3d = None
+                continue
+            rays_norm = rays / norms
+            cos_mat = rays_norm @ rays_norm.T
+            np.fill_diagonal(cos_mat, 1.0)
+            max_angle = float(np.degrees(np.arccos(np.clip(cos_mat.min(), -1.0, 1.0))))
+            if max_angle < min_parallax_deg:
+                track.point3d = None
+                continue
+
+        track.point3d = pt_np

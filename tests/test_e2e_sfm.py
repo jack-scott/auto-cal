@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from autocal.io.colmap import parse_cameras, parse_images
-from autocal.engine.sfm import SfmOptions, optimize_poses
+from autocal.engine.sfm_solver import SfmOptions, optimize_poses
 
 # ---------------------------------------------------------------------------
 # Dataset paths

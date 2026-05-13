@@ -1,5 +1,5 @@
 """
-SfM engine — solves camera poses given a fixed calibration.
+SfM solver — estimates camera poses given a fixed calibration.
 
 Pose convention
 ---------------
@@ -19,8 +19,8 @@ Pipeline
    refinement) with distorted pixel observations.
 6. Build GTSAM factor graph:
      - PriorFactorPose3 for each camera that has an initial pose.
-     - GenericProjectionFactorCal3DS2 per (camera, landmark, 2D observation)
-       with calibration as a fixed constant (not a graph variable).
+     - GenericProjectionFactorCal3DS2 (fixed Cal3DS2 constant, not a key),
+       or GenericProjectionFactorCal3Fisheye per (camera, landmark, 2D observation).
 7. Optimise with Dogleg (trust-region, more robust than LM for large initial error).
 8. Return optimised poses and track data.
 """
@@ -28,54 +28,29 @@ Pipeline
 from __future__ import annotations
 
 import re as _re
+from dataclasses import dataclass
+
 import cv2
 import gtsam
 import numpy as np
-from dataclasses import dataclass
 
 from autocal.engine.features import (
     Track,
+    all_positive_depth,
     build_tracks,
+    cal_to_K,
     detect_sift,
+    filter_by_reproj,
     filter_matches_ransac,
     match_sift,
+    triangulate_gtsam,
+    undistort_keypoints,
 )
 
 
 @dataclass
 class SfmOptions:
-    """Tunable parameters for the SfM pose solver.
-
-    Attributes:
-        sift_features:  Max SIFT features per image (0 = unlimited).
-        match_ratio:    Lowe ratio test threshold for SIFT matching.
-        min_matches:    Minimum matches required to keep a pair.
-        lm_iterations:  Max Levenberg–Marquardt iterations.
-        pose_noise_m:   1-sigma translation noise for pose priors (metres).
-        pose_noise_rad: 1-sigma rotation noise for pose priors (radians).
-        pixel_noise_px:      1-sigma pixel noise on reprojection factors.
-        max_tracks:          Max triangulated tracks to include in the graph.
-        max_reproj_error_px: Discard tracks whose initial reprojection error
-                             (with the provided poses) exceeds this threshold in
-                             any camera.  Removes false SIFT matches before the
-                             graph is built.  Only applied when initial_poses is
-                             provided.  0 = disabled.
-        max_landmark_dist_m: Discard triangulated landmarks farther than this
-                             from every observing camera.  Eliminates near-
-                             degenerate points (nearly-parallel rays) that cause
-                             singular Jacobians in the factor graph.  0 = disabled.
-        min_parallax_deg:    Discard landmarks where the maximum viewing angle
-                             between any two cameras is below this threshold.
-                             Enforces a minimum triangulation baseline.  Small
-                             angles produce poorly-conditioned Jacobians even
-                             when the point is within the distance limit.
-                             0 = disabled.
-        huber_loss:          Use a Huber robust noise model for projection
-                             factors instead of Gaussian.  Downweights
-                             observations with large reprojection errors (> k
-                             pixels where k = pixel_noise_px) so surviving
-                             outlier matches don't dominate the solution.
-    """
+    """Tunable parameters for the SfM pose solver."""
     sift_features: int = 0
     match_ratio: float = 0.75
     min_matches: int = 8
@@ -101,24 +76,15 @@ def optimize_poses(
     """Solve camera poses with calibration held fixed.
 
     Args:
-        images:             Ordered list of (img_id, jpeg_bytes).  Image bytes
-                            are used for SIFT detection only when
-                            preloaded_features is None.
-        calibration:        Fixed camera intrinsics.  Not a graph variable.
+        images:             Ordered list of (img_id, jpeg_bytes).
+        calibration:        Fixed camera intrinsics.
         opts:               Tuning options.
-        initial_poses:      If provided, Pose3(R_wc, t) per img_id used as
-                            initial values and prior factors.
-        preloaded_features: If provided, {img_id: (kps, descs)} loaded from a
-                            cached MCAP topic.  Detection is skipped.
-                            Features are truncated to opts.sift_features if set.
+        initial_poses:      If provided, used as initial values and prior factors.
+        preloaded_features: If provided, {img_id: (kps, descs)} skips detection.
 
     Returns:
-        Dict with keys:
-          "poses"        — dict[int, Pose3] optimised poses (R_wc, t)
-          "n_tracks"     — number of triangulated tracks used
-          "keypoints"    — dict[int, np.ndarray] SIFT keypoints per image
-          "descriptors"  — dict[int, np.ndarray] SIFT descriptors per image
-          "triangulated" — list[Track] with point3d set
+        Dict with keys: "poses", "initial_poses", "n_tracks",
+        "keypoints", "descriptors", "triangulated".
     """
     img_ids = [img_id for img_id, _ in images]
     id_to_idx: dict[int, int] = {img_id: i for i, img_id in enumerate(img_ids)}
@@ -167,20 +133,8 @@ def optimize_poses(
     # Undistort keypoints for geometry (RANSAC + essential matrix)
     # ------------------------------------------------------------------ #
     _fisheye = isinstance(calibration, gtsam.Cal3Fisheye)
-    K = _cal_to_K(calibration)
-    kp_dist = np.array(calibration.k(), dtype=np.float64)
-    if np.any(kp_dist != 0.0):
-        keypoints_for_geo: dict[int, np.ndarray] = {}
-        for img_id, kps in keypoints.items():
-            pts = kps.reshape(-1, 1, 2).astype(np.float64)
-            if _fisheye:
-                D = kp_dist[:4].reshape(4, 1)
-                undist = cv2.fisheye.undistortPoints(pts, K, D, P=K)
-            else:
-                undist = cv2.undistortPoints(pts, K, kp_dist[:4], P=K)
-            keypoints_for_geo[img_id] = undist.reshape(-1, 2).astype(np.float32)
-    else:
-        keypoints_for_geo = keypoints
+    K = cal_to_K(calibration)
+    keypoints_for_geo = undistort_keypoints(keypoints, calibration)
 
     # ------------------------------------------------------------------ #
     # RANSAC geometric filtering
@@ -211,25 +165,21 @@ def optimize_poses(
     if has_priors:
         poses: dict[int, gtsam.Pose3] = dict(initial_poses)
     else:
-        poses = _chain_essential_matrix(
-            img_ids, keypoints_for_geo, matches_per_pair, K,
-        )
+        poses = _chain_essential_matrix(img_ids, keypoints_for_geo, matches_per_pair, K)
 
     # ------------------------------------------------------------------ #
     # Triangulate — GTSAM multi-view with nonlinear refinement
-    # Uses distorted pixel observations so the calibration model is applied
-    # correctly; all visible cameras contribute (not just the first 2).
     # ------------------------------------------------------------------ #
     tracks = build_tracks(matches_per_pair)
-    _triangulate_gtsam(tracks, keypoints, calibration, poses, id_to_idx,
-                       max_dist=opts.max_landmark_dist_m,
-                       min_parallax_deg=opts.min_parallax_deg)
+    triangulate_gtsam(tracks, keypoints, calibration, poses,
+                      max_dist=opts.max_landmark_dist_m,
+                      min_parallax_deg=opts.min_parallax_deg)
     good = [
         t for t in tracks
-        if t.point3d is not None and _all_positive_depth(t.point3d, t.observations, poses)
+        if t.point3d is not None and all_positive_depth(t.point3d, t.observations, poses)
     ]
     if opts.max_reproj_error_px > 0 and has_priors:
-        good = _filter_by_reproj(good, keypoints, calibration, poses, opts.max_reproj_error_px)
+        good = filter_by_reproj(good, keypoints, poses, calibration, opts.max_reproj_error_px)
 
     good.sort(key=lambda t: len(t.observations), reverse=True)
     triangulated = good[: opts.max_tracks]
@@ -264,12 +214,12 @@ def optimize_poses(
     }
 
     return {
-        "poses": opt_poses,
-        "initial_poses": poses,   # pre-optimisation (E-matrix chain or provided priors)
-        "n_tracks": len(triangulated),
-        "keypoints": keypoints,
-        "descriptors": descriptors,
-        "triangulated": triangulated,
+        "poses":         opt_poses,
+        "initial_poses": poses,
+        "n_tracks":      len(triangulated),
+        "keypoints":     keypoints,
+        "descriptors":   descriptors,
+        "triangulated":  triangulated,
     }
 
 
@@ -284,7 +234,7 @@ def _build_and_optimize(
     img_ids: list,
     keypoints: dict,
     calibration,
-    opts: "SfmOptions",
+    opts: SfmOptions,
     has_priors: bool,
     initial_poses: dict | None,
     fisheye: bool,
@@ -293,9 +243,9 @@ def _build_and_optimize(
     """Build a GTSAM factor graph and optimize, removing degenerate landmarks on retry.
 
     When GTSAM throws IndeterminantLinearSystemException it names the offending
-    P-variable in the error message.  We parse that index, drop the landmark from
-    the active set, rebuild the graph (re-numbering P-variables), and retry.  Up
-    to max_retries landmarks can be dropped before the exception is re-raised.
+    variable in the error message.  p-variables (landmarks) are dropped; x-variables
+    (cameras) are pinned with a tight prior.  Up to max_retries removals/pins before
+    the exception is re-raised.
 
     Returns:
         (result_values, graph, initial_values, n_active_tracks)
@@ -303,8 +253,8 @@ def _build_and_optimize(
     X = gtsam.symbol_shorthand.X
     P = gtsam.symbol_shorthand.P
 
-    excluded: set[int] = set()   # original indices into `triangulated` to skip
-    pinned: set[int] = set()     # X-variable indices to pin with a tight prior
+    excluded: set[int] = set()
+    pinned: set[int] = set()
     _tight_noise = gtsam.noiseModel.Diagonal.Sigmas(
         np.array([1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6])
     )
@@ -329,7 +279,6 @@ def _build_and_optimize(
         else:
             graph.add(gtsam.PriorFactorPose3(X(0), poses[img_ids[0]], _tight_noise))
 
-        # Pin any cameras that became degenerate in a previous attempt.
         for x_idx in pinned:
             graph.add(gtsam.PriorFactorPose3(X(x_idx), poses[img_ids[x_idx]], _tight_noise))
 
@@ -398,149 +347,6 @@ def _build_and_optimize(
     raise RuntimeError("_build_and_optimize: max retries exceeded")
 
 
-def _triangulate_gtsam(
-    tracks: list[Track],
-    keypoints: dict[int, np.ndarray],
-    calibration: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
-    poses: dict[int, gtsam.Pose3],
-    id_to_idx: dict[int, int],
-    max_dist: float = 0.0,
-    min_parallax_deg: float = 0.0,
-) -> None:
-    """Triangulate tracks in-place using gtsam.triangulatePoint3.
-
-    Uses all visible cameras (not just 2) and applies nonlinear refinement,
-    which is substantially more accurate than 2-view DLT.  Observations are
-    distorted pixels — the calibration model handles projection internally.
-
-    max_dist > 0 discards points farther than that from every observing camera.
-    min_parallax_deg > 0 requires the maximum viewing angle across all camera
-    pairs to exceed this threshold — small angles produce near-zero Jacobians
-    that make the landmark information matrix singular.
-    """
-    for track in tracks:
-        visible = [
-            (img_id, kp_idx)
-            for img_id, kp_idx in track.observations.items()
-            if img_id in poses and img_id in id_to_idx
-        ]
-        if len(visible) < 2:
-            continue
-
-        pose_vec = gtsam.Pose3Vector()
-        meas_vec = gtsam.Point2Vector()
-        for img_id, kp_idx in visible:
-            pose_vec.append(poses[img_id])
-            kp = keypoints[img_id][kp_idx]
-            meas_vec.append(gtsam.Point2(float(kp[0]), float(kp[1])))
-
-        try:
-            pt = gtsam.triangulatePoint3(pose_vec, calibration, meas_vec,
-                                         rank_tol=1e-9, optimize=True)
-            pt_np = np.array([float(pt[0]), float(pt[1]), float(pt[2])])
-        except Exception:
-            track.point3d = None
-            continue
-
-        if max_dist > 0.0:
-            min_cam_dist = min(
-                np.linalg.norm(pt_np - poses[img_id].translation())
-                for img_id, _ in visible
-            )
-            if min_cam_dist > max_dist:
-                track.point3d = None
-                continue
-
-        if min_parallax_deg > 0.0:
-            cam_positions = np.array([poses[img_id].translation() for img_id, _ in visible])
-            rays = pt_np - cam_positions                                   # (N, 3)
-            norms = np.linalg.norm(rays, axis=1, keepdims=True)
-            if np.any(norms < 1e-10):
-                track.point3d = None
-                continue
-            rays_norm = rays / norms
-            cos_mat = rays_norm @ rays_norm.T                              # (N, N)
-            np.fill_diagonal(cos_mat, 1.0)
-            max_angle_deg = float(np.degrees(np.arccos(np.clip(cos_mat.min(), -1.0, 1.0))))
-            if max_angle_deg < min_parallax_deg:
-                track.point3d = None
-                continue
-
-        track.point3d = pt_np
-
-
-def _cal_to_K(cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye) -> np.ndarray:
-    return np.array([
-        [cal.fx(), cal.skew(), cal.px()],
-        [0.0,      cal.fy(),   cal.py()],
-        [0.0,      0.0,        1.0     ],
-    ], dtype=np.float64)
-
-
-def _filter_by_reproj(
-    tracks: list[Track],
-    keypoints: dict[int, np.ndarray],
-    cal: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
-    poses: dict[int, gtsam.Pose3],
-    max_err_px: float,
-) -> list[Track]:
-    """Keep only tracks where every observation reprojects within max_err_px."""
-    _fisheye = isinstance(cal, gtsam.Cal3Fisheye)
-    k_coeffs = np.array(cal.k(), dtype=np.float64)
-    kept = []
-    for track in tracks:
-        ok = True
-        for img_id, kp_idx in track.observations.items():
-            if img_id not in poses:
-                continue
-            pose = poses[img_id]
-            R_cw = pose.rotation().matrix().T
-            p_cam = R_cw @ (track.point3d - pose.translation())
-            x, y, z = p_cam
-            if z <= 0:
-                ok = False
-                break
-            if _fisheye:
-                r = np.sqrt(x*x + y*y)
-                if r < 1e-10:
-                    pu, pv = cal.px(), cal.py()
-                else:
-                    theta = np.arctan2(r, z)
-                    t2 = theta * theta
-                    rd = theta * (1 + k_coeffs[0]*t2 + k_coeffs[1]*t2**2
-                                  + k_coeffs[2]*t2**3 + k_coeffs[3]*t2**4)
-                    s = rd / r
-                    pu = cal.fx() * s * x + cal.px()
-                    pv = cal.fy() * s * y + cal.py()
-            else:
-                xn, yn = x / z, y / z
-                pu = cal.fx() * xn + cal.px()
-                pv = cal.fy() * yn + cal.py()
-            obs = keypoints[img_id][kp_idx]
-            if np.hypot(pu - obs[0], pv - obs[1]) > max_err_px:
-                ok = False
-                break
-        if ok:
-            kept.append(track)
-    return kept
-
-
-def _all_positive_depth(
-    pt3d: np.ndarray,
-    observations: dict,
-    poses: dict[int, gtsam.Pose3],
-) -> bool:
-    for img_id in observations:
-        if img_id not in poses:
-            continue
-        pose = poses[img_id]
-        R_cw = pose.rotation().matrix().T  # R_wc stored; .T gives R_cw
-        z = (R_cw @ (pt3d - pose.translation()))[2]
-        if z <= 0:
-            return False
-    return True
-
-
 def _chain_essential_matrix(
     img_ids: list[int],
     keypoints: dict[int, np.ndarray],
@@ -553,8 +359,6 @@ def _chain_essential_matrix(
     Translation is unit-scale (GTSAM resolves scale from feature tracks).
     keypoints should be undistorted (caller's responsibility).
     """
-
-    # Camera facing X+: camera Z (optical) = world X+
     R_wc_0 = gtsam.Rot3(np.array([
         [0.0,  0.0, 1.0],
         [1.0,  0.0, 0.0],
@@ -585,12 +389,10 @@ def _chain_essential_matrix(
 
         _, R_rel, t_rel, _ = cv2.recoverPose(E, pts_a, pts_b, K, mask=mask)
 
-        # cv2.recoverPose gives R, t such that P_camB = R_rel @ P_camA + t_rel
-        # R_cw_B = R_rel @ R_cw_A  →  R_wc_B = R_wc_A @ R_rel^T
+        # cv2.recoverPose: P_camB = R_rel @ P_camA + t_rel
+        # R_wc_B = R_wc_A @ R_rel^T  (t is unit-scale)
         R_wc_a = pose_a.rotation().matrix()
         R_wc_b = gtsam.Rot3(R_wc_a @ R_rel.T)
-
-        # t_B = t_A - R_wc_B @ t_rel  (unit scale)
         t_b = pose_a.translation() - R_wc_b.matrix() @ t_rel.flatten()
         poses[id_b] = gtsam.Pose3(R_wc_b, gtsam.Point3(*t_b))
 

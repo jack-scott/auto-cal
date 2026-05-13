@@ -28,7 +28,7 @@ import numpy as np
 import pytest
 
 from autocal.io.colmap import parse_cameras, parse_images
-from autocal.engine.calibration import CalibrationOptions, optimize_sfm
+from autocal.engine.calib_solver import CalibrationOptions, optimize_sfm
 
 # ---------------------------------------------------------------------------
 # Dataset paths

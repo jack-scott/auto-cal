@@ -35,7 +35,7 @@ from foxglove_schemas_protobuf.CameraCalibration_pb2 import CameraCalibration
 from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 from foxglove_schemas_protobuf.FrameTransform_pb2 import FrameTransform
 
-from autocal.engine.calibration import CalibrationOptions, optimize_sfm
+from autocal.engine.calib_solver import CalibrationOptions, optimize_sfm
 from autocal.gtsam_bridge.conversions import (
     calibration_from_mcap_msg,
     camera_calibration_from_cal3ds2,

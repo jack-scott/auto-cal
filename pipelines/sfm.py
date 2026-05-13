@@ -45,12 +45,10 @@ import numpy as np
 from foxglove_schemas_protobuf.CameraCalibration_pb2 import CameraCalibration
 from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 from foxglove_schemas_protobuf.FrameTransform_pb2 import FrameTransform
-from foxglove_schemas_protobuf.PackedElementField_pb2 import PackedElementField
-from foxglove_schemas_protobuf.PointCloud_pb2 import PointCloud
 
 from autocal.engine.features import decode_sift_features, encode_sift_features
-from autocal.engine.sfm import SfmOptions, optimize_poses
-from autocal.engine.visualization import write_camera_path
+from autocal.engine.sfm_solver import SfmOptions, optimize_poses
+from autocal.engine.visualization import make_point_cloud, write_camera_path
 from autocal.gtsam_bridge.conversions import (
     calibration_from_mcap_msg,
     frame_transform_from_pose3,
@@ -72,21 +70,6 @@ APE_TOPIC             = "/ape"
 APE_SUMMARY_TOPIC     = "/ape/summary"
 SIFT_FEATURES_TOPIC   = "/camera/sift_features"
 
-
-def _make_point_cloud(pts: list, t_ns: int) -> PointCloud:
-    xyz = np.array([[p[0], p[1], p[2]] for p in pts], dtype=np.float32)
-    pc = PointCloud()
-    pc.timestamp.CopyFrom(ns_to_timestamp(t_ns))
-    pc.frame_id = "map"
-    pc.pose.orientation.w = 1.0
-    pc.point_stride = 12
-    for name, offset in [("x", 0), ("y", 4), ("z", 8)]:
-        f = pc.fields.add()
-        f.name = name
-        f.offset = offset
-        f.type = PackedElementField.FLOAT32
-    pc.data = xyz.tobytes()
-    return pc
 
 
 def main() -> None:
@@ -254,7 +237,8 @@ def main() -> None:
         # Sparse point cloud
         pts = [track.point3d for track in triangulated if track.point3d is not None]
         if pts:
-            writer.write(POINTS_TOPIC, _make_point_cloud(pts, raw_images[0][0]),
+            writer.write(POINTS_TOPIC,
+                         make_point_cloud(np.array(pts, dtype=np.float32), raw_images[0][0]),
                          raw_images[0][0])
 
         # Camera frustums + paths

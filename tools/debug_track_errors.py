@@ -10,7 +10,7 @@ import gtsam
 import numpy as np
 
 from autocal.io.colmap import parse_cameras, parse_images
-from autocal.engine.calibration import _all_positive_depth
+from autocal.engine.features import all_positive_depth
 from autocal.engine.features import detect_sift, match_sift, build_tracks, triangulate_tracks
 
 DATA_ROOT = Path(__file__).parent.parent / "data/eth3d_pipes/pipes"
@@ -65,7 +65,7 @@ def main():
 
     triangulate_tracks(tracks, keypoints_for_tri, K, gt_poses)
     good = [t for t in tracks if t.point3d is not None
-            and _all_positive_depth(t.point3d, t.observations, gt_poses)]
+            and all_positive_depth(t.point3d, t.observations, gt_poses)]
 
     print(f"Total good tracks: {len(good)}")
     print(f"Observation count distribution:")

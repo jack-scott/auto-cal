@@ -14,7 +14,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from autocal.io.colmap import parse_cameras, parse_images
-from autocal.engine.calibration import CalibrationOptions, optimize_sfm, _all_positive_depth
+from autocal.engine.calib_solver import CalibrationOptions, optimize_sfm
+from autocal.engine.features import all_positive_depth
 from autocal.engine.features import detect_sift, match_sift, build_tracks, triangulate_tracks
 
 DATA_ROOT = Path(__file__).parent.parent / "data/eth3d_pipes/pipes"
@@ -87,7 +88,7 @@ def check_reprojection_error(
     good = [
         t for t in tracks
         if t.point3d is not None
-        and _all_positive_depth(t.point3d, t.observations, gt_poses)
+        and all_positive_depth(t.point3d, t.observations, gt_poses)
     ]
     good.sort(key=lambda t: len(t.observations), reverse=True)
     triangulated = good[:max_tracks]

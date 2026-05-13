@@ -10,8 +10,11 @@ import gtsam
 import numpy as np
 
 from autocal.io.colmap import parse_cameras, parse_images
-from autocal.engine.calibration import CalibrationOptions, optimize_sfm, _all_positive_depth, _max_reproj_error
-from autocal.engine.features import detect_sift, match_sift, build_tracks, triangulate_tracks
+from autocal.engine.calib_solver import CalibrationOptions, optimize_sfm
+from autocal.engine.features import (
+    all_positive_depth, filter_by_reproj, max_reproj_error,
+    detect_sift, match_sift, build_tracks, triangulate_tracks,
+)
 
 DATA_ROOT = Path(__file__).parent.parent / "data/eth3d_pipes/pipes"
 UNDIST_IMAGES = DATA_ROOT / "images/dslr_images_undistorted"
@@ -77,20 +80,10 @@ def main():
 
     triangulate_tracks(tracks, keypoints_for_tri, K, gt_poses)
     good = [t for t in tracks if t.point3d is not None
-            and _all_positive_depth(t.point3d, t.observations, gt_poses)]
+            and all_positive_depth(t.point3d, t.observations, gt_poses)]
 
     # Compute reprojection errors with GT cal for all tracks
-    gt_k = np.array(gt_cal.k(), dtype=np.float64)
-    errors = []
-    for t in good:
-        e = _max_reproj_error(
-            t.point3d, t.observations, keypoints, gt_poses,
-            gt_cal.fx(), gt_cal.fy(), gt_cal.px(), gt_cal.py(),
-            gt_k, False  # not fisheye
-        )
-        errors.append(e)
-
-    errors.sort()
+    errors = sorted(max_reproj_error(t, keypoints, gt_poses, gt_cal) for t in good)
     print(f"Track count: {len(good)}")
     print(f"Max reprojection error (GT cal) percentiles:")
     for pct in [50, 75, 90, 95, 99, 100]:
@@ -98,30 +91,14 @@ def main():
         print(f"  p{pct}: {errors[min(idx, len(errors)-1)]:.2f}px")
 
     # Also compute error with initial_cal
-    ini_k = np.array(initial_cal.k(), dtype=np.float64)
-    errors_ini = []
-    for t in good:
-        e = _max_reproj_error(
-            t.point3d, t.observations, keypoints, gt_poses,
-            initial_cal.fx(), initial_cal.fy(), initial_cal.px(), initial_cal.py(),
-            ini_k, False
-        )
-        errors_ini.append(e)
-    errors_ini.sort()
+    errors_ini = sorted(max_reproj_error(t, keypoints, gt_poses, initial_cal) for t in good)
     print(f"\nMax reprojection error (initial_cal, 10% wrong fx) percentiles:")
     for pct in [50, 75, 90, 95, 99, 100]:
         idx = int(pct * len(errors_ini) / 100)
         print(f"  p{pct}: {errors_ini[min(idx, len(errors_ini)-1)]:.2f}px")
 
     # After applying 20px filter on GT cal
-    filtered = [
-        t for t in good
-        if _max_reproj_error(
-            t.point3d, t.observations, keypoints, gt_poses,
-            gt_cal.fx(), gt_cal.fy(), gt_cal.px(), gt_cal.py(),
-            gt_k, False
-        ) <= 20.0
-    ]
+    filtered = filter_by_reproj(good, keypoints, gt_poses, gt_cal, 20.0)
     print(f"\nAfter 20px filter: {len(filtered)} tracks")
 
     # Now run optimize_sfm

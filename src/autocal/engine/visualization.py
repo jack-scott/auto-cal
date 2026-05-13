@@ -17,8 +17,10 @@ from __future__ import annotations
 import numpy as np
 import gtsam
 
-from foxglove_schemas_protobuf.SceneUpdate_pb2 import SceneUpdate
 from foxglove_schemas_protobuf.LinePrimitive_pb2 import LinePrimitive
+from foxglove_schemas_protobuf.PackedElementField_pb2 import PackedElementField
+from foxglove_schemas_protobuf.PointCloud_pb2 import PointCloud
+from foxglove_schemas_protobuf.SceneUpdate_pb2 import SceneUpdate
 
 from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
 
@@ -163,6 +165,28 @@ def write_camera_path(
         prev_pos = t_cam.copy()
 
         writer.write(topic, su, t_ns)
+
+
+def make_point_cloud(pts: np.ndarray, t_ns: int, frame_id: str = "map") -> PointCloud:
+    """Pack a float32 XYZ array into a PointCloud proto.
+
+    Args:
+        pts:      shape-(N,3) float32 array of 3D points.
+        t_ns:     Timestamp in Unix nanoseconds.
+        frame_id: Frame the points are expressed in.
+    """
+    pc = PointCloud()
+    pc.timestamp.CopyFrom(ns_to_timestamp(t_ns))
+    pc.frame_id = frame_id
+    pc.pose.orientation.w = 1.0
+    pc.point_stride = 12
+    for name, offset in [("x", 0), ("y", 4), ("z", 8)]:
+        f = pc.fields.add()
+        f.name = name
+        f.offset = offset
+        f.type = PackedElementField.FLOAT32
+    pc.data = pts.astype(np.float32).tobytes()
+    return pc
 
 
 # ---------------------------------------------------------------------------
