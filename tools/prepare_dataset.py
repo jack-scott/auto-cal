@@ -42,7 +42,7 @@ from foxglove_schemas_protobuf.CameraCalibration_pb2 import CameraCalibration
 from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 from foxglove_schemas_protobuf.LocationFix_pb2 import LocationFix
 
-from autocal.engine.features import detect_sift
+from autocal.engine.features import detect_sift, encode_sift_features
 from autocal.engine.visualization import write_camera_path
 from autocal.gtsam_bridge.conversions import (
     camera_calibration_from_cal3ds2,
@@ -50,7 +50,7 @@ from autocal.gtsam_bridge.conversions import (
     frame_transform_from_pose3,
 )
 from autocal.io.colmap import parse_cameras, parse_images
-from autocal.io.mcap_writer import McapWriter, encode_sift_features, ns_to_timestamp
+from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
 from autocal.optics.camera import fx_from_exif
 
 SIFT_FEATURES_TOPIC = "/camera/sift_features"
@@ -149,7 +149,7 @@ def prepare_eth3d_pipes(output: Path) -> None:
             poses_by_ts[t_ns] = poses[name]
 
             kps, descs = detect_sift(img_data, n_features=_PREPARE_SIFT_N)
-            writer.write_json(SIFT_FEATURES_TOPIC, encode_sift_features(kps, descs), t_ns)
+            writer.write(SIFT_FEATURES_TOPIC, encode_sift_features(kps, descs), t_ns)
 
             print(f"\r  {i+1}/{len(names)}  {Path(name).name}  ({len(kps)} kps)",
                   end="", flush=True)
@@ -229,7 +229,7 @@ def _prepare_eth3d_raw(url: str, archive: Path, extract_dir: Path,
                 writer.write("/tf", ft, t_ns)
                 poses_by_ts[t_ns] = poses[full_name]
 
-            writer.write_json(SIFT_FEATURES_TOPIC, encode_sift_features(kps, descs), t_ns)
+            writer.write(SIFT_FEATURES_TOPIC, encode_sift_features(kps, descs), t_ns)
 
             print(f"\r  Writing {i+1}/{len(image_files)}  {img_path.name}",
                   end="", flush=True)

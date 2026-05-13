@@ -174,18 +174,27 @@ def optimize_poses(
     triangulate_gtsam(tracks, keypoints, calibration, poses,
                       max_dist=opts.max_landmark_dist_m,
                       min_parallax_deg=opts.min_parallax_deg)
-    good = [
+
+    n_triangulated = sum(1 for t in tracks if t.point3d is not None)
+    n_none         = len(tracks) - n_triangulated
+    after_cheirality = [
         t for t in tracks
         if t.point3d is not None and all_positive_depth(t.point3d, t.observations, poses)
     ]
+    n_behind = n_triangulated - len(after_cheirality)
+    good = after_cheirality
     if opts.max_reproj_error_px > 0 and has_priors:
         good = filter_by_reproj(good, keypoints, poses, calibration, opts.max_reproj_error_px)
+    n_reproj = len(after_cheirality) - len(good)
 
     good.sort(key=lambda t: len(t.observations), reverse=True)
     triangulated = good[: opts.max_tracks]
     print(
-        f"  Tracks: {len(tracks)} built, {len(good)} cheirality-ok / reproj-ok, "
-        f"using top {len(triangulated)}",
+        f"  Tracks: {len(tracks)} built → "
+        f"{n_none} failed triangulation, "
+        f"{n_behind} behind camera, "
+        f"{n_reproj} reproj>{opts.max_reproj_error_px:.0f}px, "
+        f"{len(good)} ok → using top {len(triangulated)}",
         flush=True,
     )
 

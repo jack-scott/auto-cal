@@ -98,3 +98,44 @@ World/map frame: X+ forward (arbitrary heading), Y+ left, Z+ up — or ENU when 
 **IMPORTANT — historical bug to avoid**: earlier code stored R_cw in Pose3 rotation, requiring
 a flip (`_to_gtsam_pose`) at every GTSAM boundary. New code must store R_wc natively to
 match GTSAM's expectation and avoid this error.
+
+## Known issues and open problems
+
+See `docs/degenerate_pair_geometry.md` for a full write-up.
+
+**Degenerate frame pairs in eth3d_exhibition_hall (frames 61-64):**
+- Pairs 61-62 and 63-64 are near-duplicate frames (0.2 mm baseline). RANSAC accepts
+  ~98% of all matches as inliers — the essential matrix is completely ill-conditioned.
+  These pairs produce no useful geometry and cause cheirality failures in surrounding tracks.
+- Pair 62-63 is rotation-dominated (57 mm baseline, 23° rotation). GT poses triangulate
+  fine (99.7% success), but 5 cm / 0.05 rad pose noise causes 98.5% failure.
+- The classifier in `src/autocal/engine/pair_classifier.py` detects STATIC pairs by
+  baseline and rotation thresholds. `classify_pair_without_poses` is a not-implemented stub.
+- With noisy poses, skipping STATIC pairs before triangulation is the correct fix.
+  Rotation-dominated pairs under noise are an open question (ratio gate vs. reprojection only).
+
+## Investigation guidelines for Claude
+
+**Before touching any code, understand the failure mode at each pipeline stage.**
+The symptoms at the end of the pipeline (e.g. "30% cheirality failures") rarely point
+directly to the fix. In this project:
+
+- A high cheirality failure rate is not evidence that matches are bad. It can also mean
+  the camera poses fed to the triangulator are wrong or degenerate.
+- A high RANSAC retention rate (>90%) is a red flag, not a sign of good matches — it
+  means the epipolar constraint is not constraining anything.
+- APE getting *worse* after optimisation means some cameras have no valid constraints
+  (under-determined), not that the optimizer is broken.
+
+**Investigation workflow:**
+1. Add diagnostic prints or a breakdown test to measure the failure at each stage.
+2. Isolate the failing cases (which pairs, which frames, which tracks).
+3. Use GT geometry as an oracle to classify failures — e.g. Sampson distance against
+   GT poses separates bad matches from pose-noise-induced triangulation failures.
+4. Look at actual images and matches before drawing conclusions.
+5. Only then design a fix, and write a test that would have caught the problem first.
+
+**Do not:**
+- Add a cv2 fallback triangulator because GTSAM throws — this masks the real problem.
+- Change exception handling or tolerances to make failures disappear silently.
+- Assume a fix is correct without a test that fails before the fix and passes after.

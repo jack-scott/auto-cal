@@ -581,6 +581,9 @@ def triangulate_gtsam(
         min_parallax_deg:  Discard points where the max viewing angle
                            across all camera pairs is below this.  0 = disabled.
     """
+    _exc_counts: dict[str, int] = {}
+    _cheirality_by_pair: dict[tuple, int] = {}  # (img_id_a, img_id_b) -> count
+
     for track in tracks:
         visible = [
             (img_id, kp_idx)
@@ -601,14 +604,20 @@ def triangulate_gtsam(
             pt = gtsam.triangulatePoint3(pose_vec, cal, meas_vec,
                                          rank_tol=1e-9, optimize=True)
             pt_np = np.array([float(pt[0]), float(pt[1]), float(pt[2])])
-        except Exception:
+        except Exception as _exc:
             track.point3d = None
+            key = type(_exc).__name__ + ": " + str(_exc)[:60]
+            _exc_counts[key] = _exc_counts.get(key, 0) + 1
+            if "Cheirality" in type(_exc).__name__ or "Cheirality" in str(_exc):
+                pair = tuple(img_id for img_id, _ in visible)
+                _cheirality_by_pair[pair] = _cheirality_by_pair.get(pair, 0) + 1
             continue
 
         if max_dist > 0.0:
             if min(np.linalg.norm(pt_np - poses[img_id].translation())
                    for img_id, _ in visible) > max_dist:
                 track.point3d = None
+                _exc_counts["max_dist filter"] = _exc_counts.get("max_dist filter", 0) + 1
                 continue
 
         if min_parallax_deg > 0.0:
@@ -617,6 +626,7 @@ def triangulate_gtsam(
             norms = np.linalg.norm(rays, axis=1, keepdims=True)
             if np.any(norms < 1e-10):
                 track.point3d = None
+                _exc_counts["zero-norm ray"] = _exc_counts.get("zero-norm ray", 0) + 1
                 continue
             rays_norm = rays / norms
             cos_mat = rays_norm @ rays_norm.T
@@ -624,9 +634,20 @@ def triangulate_gtsam(
             max_angle = float(np.degrees(np.arccos(np.clip(cos_mat.min(), -1.0, 1.0))))
             if max_angle < min_parallax_deg:
                 track.point3d = None
+                _exc_counts[f"parallax<{min_parallax_deg}deg"] = \
+                    _exc_counts.get(f"parallax<{min_parallax_deg}deg", 0) + 1
                 continue
 
         track.point3d = pt_np
+
+    if _exc_counts:
+        print("  triangulate_gtsam failure breakdown:", flush=True)
+        for reason, count in sorted(_exc_counts.items(), key=lambda x: -x[1]):
+            print(f"    {count:5d}  {reason}", flush=True)
+    if _cheirality_by_pair:
+        print("  cheirality failures by camera pair:", flush=True)
+        for pair, count in sorted(_cheirality_by_pair.items(), key=lambda x: -x[1])[:20]:
+            print(f"    {count:5d}  pair {pair}", flush=True)
 
 
 def chain_essential_matrix(

@@ -43,6 +43,7 @@ from autocal.io.mcap_reader import get_topic_map, iter_messages
 from autocal.io.mcap_writer import McapWriter
 
 TF_TOPIC            = "/tf"
+TF_GT_TOPIC         = "/tf_gt"
 CAL_TOPIC           = "/camera/calibration"
 SIFT_FEATURES_TOPIC = "/camera/sift_features"
 
@@ -131,8 +132,10 @@ def main() -> None:
             if topic == TF_TOPIC:
                 if args.remove_poses:
                     n_dropped += 1
+                    writer.write(TF_GT_TOPIC, msg, t_ns)  # preserve GT even when dropping
                     continue
                 if args.pose_noise_m > 0 or args.pose_noise_rad > 0:
+                    writer.write(TF_GT_TOPIC, msg, t_ns)  # save original before perturbing
                     msg = _perturb_pose(msg, args.pose_noise_m, args.pose_noise_rad, rng)
                     n_modified += 1
                 else:
