@@ -190,13 +190,16 @@ def filter_matches_ransac(
     pts_a = kps_a[[i for i, _ in matches]].astype(np.float64)
     pts_b = kps_b[[j for _, j in matches]].astype(np.float64)
 
-    _, mask = cv2.findFundamentalMat(
-        pts_a, pts_b,
-        method=cv2.USAC_MAGSAC,
-        ransacReprojThreshold=ransac_threshold,
-        confidence=0.999,
-        maxIters=10000,
-    )
+    try:
+        _, mask = cv2.findFundamentalMat(
+            pts_a, pts_b,
+            method=cv2.USAC_MAGSAC,
+            ransacReprojThreshold=ransac_threshold,
+            confidence=0.999,
+            maxIters=10000,
+        )
+    except cv2.error:
+        return []
     if mask is None:
         return []
 

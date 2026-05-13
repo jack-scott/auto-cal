@@ -67,6 +67,7 @@ class SfmOptions:
     ransac_threshold: float = 2.0
     classify_pairs: bool = True
     min_track_length: int = 3
+    match_window: int = 3
 
 
 def optimize_poses(
@@ -118,17 +119,27 @@ def optimize_poses(
                 print(f"  {i+1}/{len(images)}", flush=True)
 
     # ------------------------------------------------------------------ #
-    # Sequential matching
+    # Covisibility window matching
     # ------------------------------------------------------------------ #
-    print("Matching sequential pairs...", flush=True)
+    n_candidate = sum(
+        min(opts.match_window, len(img_ids) - 1 - k)
+        for k in range(len(img_ids) - 1)
+    )
+    print(f"Matching pairs (window={opts.match_window}, "
+          f"{n_candidate} candidate pairs)...", flush=True)
     matches_per_pair: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for k in range(len(img_ids) - 1):
-        id_a, id_b = img_ids[k], img_ids[k + 1]
-        m = match_sift(descriptors[id_a], descriptors[id_b], ratio=opts.match_ratio)
-        if len(m) >= opts.min_matches:
-            matches_per_pair[(id_a, id_b)] = m
+        for offset in range(1, opts.match_window + 1):
+            if k + offset >= len(img_ids):
+                break
+            id_a, id_b = img_ids[k], img_ids[k + offset]
+            if (id_a, id_b) in matches_per_pair:
+                continue
+            m = match_sift(descriptors[id_a], descriptors[id_b], ratio=opts.match_ratio)
+            if len(m) >= opts.min_matches:
+                matches_per_pair[(id_a, id_b)] = m
     print(
-        f"  {len(matches_per_pair)}/{len(img_ids)-1} pairs passed ratio test",
+        f"  {len(matches_per_pair)}/{n_candidate} pairs passed ratio test",
         flush=True,
     )
 
@@ -156,7 +167,7 @@ def optimize_poses(
         matches_per_pair = filtered
         n_after = sum(len(m) for m in matches_per_pair.values())
         print(
-            f"  RANSAC: {len(matches_per_pair)}/{len(img_ids)-1} pairs kept  "
+            f"  RANSAC: {len(matches_per_pair)}/{n_candidate} pairs kept  "
             f"({n_before} → {n_after} matches)",
             flush=True,
         )

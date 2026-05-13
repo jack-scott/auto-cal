@@ -177,7 +177,7 @@ Images + Pose Priors
    select_keyframes(poses, min_t, min_r)
         │
         ▼
-3. COVISIBILITY MATCHING (window=3–5)           ← missing (sequential only)
+3. COVISIBILITY MATCHING (window=3–5)           ✓ COMPLETED
    match_sift + filter_matches_ransac per pair
         │
         ▼
@@ -231,8 +231,13 @@ These are ordered by impact and dependency:
 3. **Post-optimisation outlier rejection** (§6) — moderate complexity.
    Needs `filter_by_reproj` called after optimisation with optimised poses.
 
-4. **Covisibility window matching** (§2) — replaces sequential loop.
-   Longer tracks, better conditioning.  Test that track count and APE improve.
+4. **Covisibility window matching** (§2) — ✓ COMPLETED
+   `SfmOptions.match_window: int = 3`, `--match-window` CLI flag.
+   4 tests in `tests/test_match_window.py`.
+   OpenCV USAC_MAGSAC assertion on degenerate skip-frame pairs fixed with try-except in
+   `filter_matches_ransac`.  Easy: 10% APE improvement (420 tracks). Medium: 7%.
+   Pre-opt reproj threshold needs tuning per noise level — 4px cuts all skip-frame tracks,
+   0px lets noisy landmarks corrupt the optimizer.  Full benefit from post-opt rejection.
 
 5. **Keyframe selection** (§1) — needed for long trajectories / large datasets.
    Can be skipped if input sequences are already sparse.

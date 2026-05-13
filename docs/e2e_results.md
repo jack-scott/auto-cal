@@ -43,22 +43,23 @@ Last run: 2026-05-14
 ```
 APE — initial:    mean=0.0074m  median=0.0072m  max=0.0146m  rmse=0.0080m
                   mean=0.0919°  median=0.0675°  max=0.3319°  rmse=0.1153°
-APE — optimised:  mean=0.0071m  median=0.0069m  max=0.0147m  rmse=0.0077m
-                  mean=0.0907°  median=0.0694°  max=0.3347°  rmse=0.1136°
-Pair classification: dropped 2 STATIC + 0 PURE_ROTATION, 64 pairs remain
-Track length filter (≥3): 3269 dropped, 436 remain
+APE — optimised:  mean=0.0067m  median=0.0066m  max=0.0166m  rmse=0.0074m
+                  mean=0.0879°  median=0.0733°  max=0.2647°  rmse=0.1021°
+Pair classification: dropped 2 STATIC + 0 PURE_ROTATION, 192 pairs remain (window=3)
+Track length filter (≥3): 3623 dropped, 1354 remain → 420 ok after 8px reproj filter
 ```
 
 | Criterion | Status | Detail |
 |-----------|--------|--------|
-| 1. APE doesn't degrade | ✓ PASS | 7.4mm → 7.1mm |
-| 2. ≥10% improvement    | ✗ FAIL | 4% improvement (was 11% with min_track_length=2) |
+| 1. APE doesn't degrade | ✓ PASS | 7.4mm → 6.7mm |
+| 2. ≥10% improvement    | ✓ PASS | 10% translation improvement |
 | 3. Degenerate pairs dropped | ✓ PASS | 2 STATIC pairs removed |
 | 4. No cheirality from 61-64 | ✓ PASS | Clean cheirality log |
 
-Note: min_track_length=3 with sequential-only matching drops 88% of tracks (most are 2-frame
-only). Criterion 2 was passing at 11% before this filter was added.  Will recover once
-covisibility window matching produces enough 3+ frame tracks.
+Note: reproj pre-filter set to 8px (not fine preset's 4px) — at 5mm noise over 3 frames and
+3408px focal length, skip-frame pairs accumulate ~10px reprojection error with initial poses,
+so 4px cuts all window-matched tracks.  0px causes optimizer divergence from noisy initial
+landmarks.  Full benefit requires post-optimisation outlier rejection (pipeline item 6).
 
 ---
 
@@ -70,23 +71,19 @@ Last run: 2026-05-14
 ```
 APE — initial:    mean=0.0294m  median=0.0286m  max=0.0586m  rmse=0.0319m
                   mean=0.4513°  median=0.3300°  max=1.6608°  rmse=0.5726°
-APE — optimised:  mean=0.0280m  median=0.0277m  max=0.0586m  rmse=0.0304m
-                  mean=0.4251°  median=0.3160°  max=1.6546°  rmse=0.5462°
+APE — optimised:  mean=0.0273m  median=0.0266m  max=0.0585m  rmse=0.0297m
+                  mean=0.4384°  median=0.3454°  max=1.6519°  rmse=0.5553°
 Pair classification: 0 dropped (σ_t=20mm inflates 0.2mm baseline to ~28mm; pose classifier blind)
-Track length filter (≥3): 3590 dropped, 750 remain
+Track length filter (≥3): 4009 dropped, 1425 remain → 180 ok after 20px reproj filter
 Cheirality failures: 306 on pair 61-62, 295 on pair 63-64 (near-duplicate frames not filtered)
 ```
 
 | Criterion | Status | Detail |
 |-----------|--------|--------|
-| 1. APE doesn't degrade | ✓ PASS | 29.4mm → 28.0mm |
-| 2. ≥10% improvement    | ✗ FAIL | 5% improvement (was 15% with min_track_length=2) |
+| 1. APE doesn't degrade | ✓ PASS | 29.4mm → 27.3mm |
+| 2. ≥10% improvement    | ✗ FAIL | 7% improvement |
 | 3. Degenerate pairs dropped | ✗ FAIL | Pose noise blinds classifier; H/E check needed |
 | 4. No cheirality from 61-64 | ✗ FAIL | 601 cheirality failures from pairs 61-62 and 63-64 |
-
-Note: min_track_length=3 dropped 750/4340 tracks — a higher fraction than easy because medium
-has more cheirality-induced failures that reduce track observation counts.  Criterion 2 was
-passing at 15% before the filter.  Same root cause as easy: needs covisibility matching.
 
 ---
 

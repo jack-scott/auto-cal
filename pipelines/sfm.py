@@ -93,6 +93,7 @@ _DEFAULTS: dict = {
     "huber_loss":       False,
     "ransac_threshold":  2.0,
     "min_track_length":  3,
+    "match_window":      3,
     "ignore_poses":      False,
 }
 
@@ -182,6 +183,9 @@ def main() -> None:
     parser.add_argument("--min-track-length", type=int, default=None,
                         help="Discard tracks seen in fewer than this many frames before "
                              "triangulation. Default 3. Set to 2 to keep all pair-wise tracks.")
+    parser.add_argument("--match-window", type=int, default=None,
+                        help="Match each frame against this many following frames (default 3). "
+                             "1 = sequential only.")
     args = parser.parse_args()
 
     # Apply preset first, then explicit CLI flags override, then fall back to _DEFAULTS.
@@ -203,6 +207,7 @@ def main() -> None:
         "huber_loss":       args.huber_loss if args.huber_loss else None,
         "ransac_threshold":  args.ransac_threshold,
         "min_track_length":  args.min_track_length,
+        "match_window":      args.match_window,
         "ignore_poses":      True if args.ignore_poses else None,
     }
     for k, v in cli_overrides.items():
@@ -271,6 +276,7 @@ def main() -> None:
         huber_loss=effective["huber_loss"],
         ransac_threshold=effective["ransac_threshold"],
         min_track_length=effective["min_track_length"],
+        match_window=effective["match_window"],
     )
 
     images = [(t_ns, bytes(msg.data)) for t_ns, msg in raw_images]
