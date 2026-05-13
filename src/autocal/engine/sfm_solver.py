@@ -46,6 +46,7 @@ from autocal.engine.features import (
     triangulate_gtsam,
     undistort_keypoints,
 )
+from autocal.engine.pair_classifier import PairClass, filter_pairs_by_geometry
 
 
 @dataclass
@@ -64,6 +65,8 @@ class SfmOptions:
     min_parallax_deg: float = 1.0
     huber_loss: bool = False
     ransac_threshold: float = 2.0
+    classify_pairs: bool = True
+    min_track_length: int = 3
 
 
 def optimize_poses(
@@ -159,9 +162,28 @@ def optimize_poses(
         )
 
     # ------------------------------------------------------------------ #
-    # Initial poses
+    # Pair classification — drop degenerate pairs before triangulation
     # ------------------------------------------------------------------ #
     has_priors = initial_poses is not None
+    if opts.classify_pairs:
+        matches_per_pair, cls_counts = filter_pairs_by_geometry(
+            matches_per_pair,
+            initial_poses if has_priors else None,
+            keypoints_for_geo,
+            K,
+        )
+        n_dropped = cls_counts[PairClass.STATIC] + cls_counts[PairClass.PURE_ROTATION]
+        if n_dropped > 0:
+            print(
+                f"  Pair classification: dropped {cls_counts[PairClass.STATIC]} STATIC "
+                f"+ {cls_counts[PairClass.PURE_ROTATION]} PURE_ROTATION, "
+                f"{len(matches_per_pair)} pairs remain",
+                flush=True,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Initial poses
+    # ------------------------------------------------------------------ #
     if has_priors:
         poses: dict[int, gtsam.Pose3] = dict(initial_poses)
     else:
@@ -171,6 +193,13 @@ def optimize_poses(
     # Triangulate — GTSAM multi-view with nonlinear refinement
     # ------------------------------------------------------------------ #
     tracks = build_tracks(matches_per_pair)
+    if opts.min_track_length > 2:
+        n_before = len(tracks)
+        tracks = [t for t in tracks if len(t.observations) >= opts.min_track_length]
+        n_dropped = n_before - len(tracks)
+        if n_dropped > 0:
+            print(f"  Track length filter (≥{opts.min_track_length}): "
+                  f"{n_dropped} dropped, {len(tracks)} remain", flush=True)
     triangulate_gtsam(tracks, keypoints, calibration, poses,
                       max_dist=opts.max_landmark_dist_m,
                       min_parallax_deg=opts.min_parallax_deg)

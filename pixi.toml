@@ -78,6 +78,54 @@ cmd = ["python", "pipelines/calibrate.py",
        "data/eth3d_exhibition_hall_calibrated.mcap"]
 depends-on = ["eth3d-exhibition-hall-sfm"]
 
+# Noise difficulty levels for exhibition hall.
+#
+# What each level tests:
+#   easy   σ_t=5mm   σ_R=0.2°  — pair classifier detects static frames from poses alone
+#   medium σ_t=20mm  σ_R=0.6°  — pose noise larger than the 0.2mm static-pair baseline;
+#                                 classifier misses 61-62/63-64 → H/E secondary check needed
+#   hard   σ_t=100mm σ_R=2.9°  — existing noisy level; optimiser currently makes APE worse
+#                                 because static pairs contaminate the graph
+
+# easy — pose classifier catches degenerate pairs, fine preset matches noise level
+[tasks.eth3d-exhibition-hall-noise-easy-perturb]
+cmd = ["python", "tools/perturb_mcap.py",
+       "data/eth3d_exhibition_hall.mcap",
+       "data/eth3d_exhibition_hall_noise_easy.mcap",
+       "--pose-noise-m", "0.005",
+       "--pose-noise-rad", "0.002"]
+depends-on = ["eth3d-exhibition-hall-prepare"]
+
+[tasks.eth3d-exhibition-hall-noise-easy-sfm]
+cmd = ["python", "pipelines/sfm.py",
+       "data/eth3d_exhibition_hall_noise_easy.mcap",
+       "data/eth3d_exhibition_hall_noise_easy_sfm.mcap",
+       "--preset", "fine",
+       "--pose-noise-m", "0.005",
+       "--pose-noise-rad", "0.002",
+       "--min-parallax-deg", "2"]
+depends-on = ["eth3d-exhibition-hall-noise-easy-perturb"]
+
+# medium — σ_t > static-pair baseline; classifier falls back to H/E test
+[tasks.eth3d-exhibition-hall-noise-medium-perturb]
+cmd = ["python", "tools/perturb_mcap.py",
+       "data/eth3d_exhibition_hall.mcap",
+       "data/eth3d_exhibition_hall_noise_medium.mcap",
+       "--pose-noise-m", "0.02",
+       "--pose-noise-rad", "0.01"]
+depends-on = ["eth3d-exhibition-hall-prepare"]
+
+[tasks.eth3d-exhibition-hall-noise-medium-sfm]
+cmd = ["python", "pipelines/sfm.py",
+       "data/eth3d_exhibition_hall_noise_medium.mcap",
+       "data/eth3d_exhibition_hall_noise_medium_sfm.mcap",
+       "--preset", "medium",
+       "--pose-noise-m", "0.02",
+       "--pose-noise-rad", "0.01",
+       "--min-parallax-deg", "2"]
+depends-on = ["eth3d-exhibition-hall-noise-medium-perturb"]
+
+# hard — existing noisy level; kept for backward compatibility
 [tasks.eth3d-exhibition-hall-perturb]
 cmd = ["python", "tools/perturb_mcap.py",
        "data/eth3d_exhibition_hall.mcap",

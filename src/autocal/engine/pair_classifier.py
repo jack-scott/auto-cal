@@ -13,6 +13,7 @@ Two entry points:
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 import cv2
 import gtsam
@@ -59,6 +60,51 @@ def classify_pair_with_poses(
     if not small_t and small_r:
         return PairClass.PURE_TRANSLATION
     return PairClass.GOOD
+
+
+def filter_pairs_by_geometry(
+    matches_per_pair: dict[tuple[Any, Any], list[tuple[int, int]]],
+    poses: dict[Any, gtsam.Pose3] | None,
+    keypoints_u: dict[Any, np.ndarray] | None = None,
+    K: np.ndarray | None = None,
+) -> tuple[dict[tuple[Any, Any], list[tuple[int, int]]], dict[PairClass, int]]:
+    """Filter pair matches by geometric classification, dropping degenerate pairs.
+
+    Uses classify_pair_with_poses when poses are provided (fast, accurate).
+    Falls back to classify_pair_without_poses (H/E ratio test) otherwise.
+
+    STATIC and PURE_ROTATION pairs are dropped.  PURE_ROTATION dropping is
+    conservative — reprojection-only factor insertion is future work.
+
+    Args:
+        matches_per_pair: {(id_a, id_b): [(i, j), ...]} as returned after RANSAC.
+        poses:            Pose priors {img_id: Pose3}, or None for image-only path.
+        keypoints_u:      Undistorted keypoints {img_id: array}.  Required if poses is None.
+        K:                3×3 intrinsic matrix.  Required if poses is None.
+
+    Returns:
+        (filtered_pairs, counts) where counts maps each PairClass to the number of
+        pairs assigned to it before filtering.
+    """
+    if poses is None and (keypoints_u is None or K is None):
+        raise ValueError(
+            "filter_pairs_by_geometry: provide either poses or both keypoints_u and K"
+        )
+
+    counts: dict[PairClass, int] = {c: 0 for c in PairClass}
+    filtered: dict[tuple[Any, Any], list[tuple[int, int]]] = {}
+
+    for (id_a, id_b), m in matches_per_pair.items():
+        if poses is not None:
+            cls = classify_pair_with_poses(poses[id_a], poses[id_b])
+        else:
+            cls = classify_pair_without_poses(keypoints_u[id_a], keypoints_u[id_b], m, K)
+        counts[cls] += 1
+        if cls in (PairClass.STATIC, PairClass.PURE_ROTATION):
+            continue  # PURE_ROTATION: future work — reprojection-only factors
+        filtered[(id_a, id_b)] = m
+
+    return filtered, counts
 
 
 def classify_pair_without_poses(

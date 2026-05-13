@@ -91,8 +91,9 @@ _DEFAULTS: dict = {
     "max_landmark_dist": 0.0,
     "min_parallax_deg": 1.0,
     "huber_loss":       False,
-    "ransac_threshold": 2.0,
-    "ignore_poses":     False,
+    "ransac_threshold":  2.0,
+    "min_track_length":  3,
+    "ignore_poses":      False,
 }
 
 # Preset parameter overrides. Keys match the _DEFAULTS keys above.
@@ -178,6 +179,9 @@ def main() -> None:
     parser.add_argument("--ransac-threshold", type=float, default=None,
                         help="RANSAC inlier threshold in pixels for F-matrix geometric "
                              "filtering (USAC_MAGSAC). 0=disabled.")
+    parser.add_argument("--min-track-length", type=int, default=None,
+                        help="Discard tracks seen in fewer than this many frames before "
+                             "triangulation. Default 3. Set to 2 to keep all pair-wise tracks.")
     args = parser.parse_args()
 
     # Apply preset first, then explicit CLI flags override, then fall back to _DEFAULTS.
@@ -197,8 +201,9 @@ def main() -> None:
         "max_landmark_dist": args.max_landmark_dist,
         "min_parallax_deg": args.min_parallax_deg,
         "huber_loss":       args.huber_loss if args.huber_loss else None,
-        "ransac_threshold": args.ransac_threshold,
-        "ignore_poses":     True if args.ignore_poses else None,
+        "ransac_threshold":  args.ransac_threshold,
+        "min_track_length":  args.min_track_length,
+        "ignore_poses":      True if args.ignore_poses else None,
     }
     for k, v in cli_overrides.items():
         if v is not None:
@@ -265,6 +270,7 @@ def main() -> None:
         min_parallax_deg=effective["min_parallax_deg"],
         huber_loss=effective["huber_loss"],
         ransac_threshold=effective["ransac_threshold"],
+        min_track_length=effective["min_track_length"],
     )
 
     images = [(t_ns, bytes(msg.data)) for t_ns, msg in raw_images]
