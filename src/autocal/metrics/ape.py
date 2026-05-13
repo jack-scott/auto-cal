@@ -16,6 +16,7 @@ Usage::
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import gtsam
@@ -23,6 +24,35 @@ import numpy as np
 
 from evo.core import metrics
 from evo.core.trajectory import PosePath3D
+
+from autocal.io.mcap_reader import register_message
+
+
+# ---------------------------------------------------------------------------
+# MCAP message dataclasses
+# ---------------------------------------------------------------------------
+
+@register_message
+@dataclasses.dataclass
+class ApePoseMsg:
+    """Per-frame APE written to the /ape topic."""
+    translation_m: float
+    rotation_deg: float
+
+
+@register_message
+@dataclasses.dataclass
+class ApeSummaryMsg:
+    """Trajectory-level APE statistics written to the /ape/summary topic."""
+    trans_mean_m:   float
+    trans_median_m: float
+    trans_max_m:    float
+    trans_rmse_m:   float
+    rot_mean_deg:   float
+    rot_median_deg: float
+    rot_max_deg:    float
+    rot_rmse_deg:   float
+    n_poses:        int
 
 
 def compute_ape(

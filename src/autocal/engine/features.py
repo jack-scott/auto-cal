@@ -40,12 +40,53 @@ Visualisation
 
 from __future__ import annotations
 
+import base64
 import io
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
 import numpy as np
+
+from autocal.io.mcap_reader import register_message
+
+
+# ---------------------------------------------------------------------------
+# SIFT feature wire format
+# ---------------------------------------------------------------------------
+
+@register_message
+@dataclass
+class SiftFeaturesMsg:
+    """Wire format for cached SIFT features stored as a JSON MCAP message."""
+    n:    int  # number of keypoints
+    kps:  str  # base64+zlib float32 array, shape (n, 2)
+    desc: str  # base64+zlib float32 array, shape (n, 128)
+
+
+def _encode_array(arr: np.ndarray) -> str:
+    return base64.b64encode(
+        zlib.compress(arr.astype(np.float32).tobytes(), level=1)
+    ).decode()
+
+
+def _decode_array(s: str, shape: tuple[int, ...]) -> np.ndarray:
+    return np.frombuffer(
+        zlib.decompress(base64.b64decode(s)), dtype=np.float32
+    ).reshape(shape)
+
+
+def encode_sift_features(kps: np.ndarray, descs: np.ndarray) -> SiftFeaturesMsg:
+    """Encode SIFT keypoints and descriptors into the MCAP wire format."""
+    return SiftFeaturesMsg(n=len(kps), kps=_encode_array(kps), desc=_encode_array(descs))
+
+
+def decode_sift_features(msg: SiftFeaturesMsg) -> tuple[np.ndarray, np.ndarray]:
+    """Decode a SiftFeaturesMsg back to (kps, descs) numpy arrays."""
+    kps   = _decode_array(msg.kps,  (msg.n, 2))
+    descs = _decode_array(msg.desc, (msg.n, 128))
+    return kps, descs
 
 
 # ---------------------------------------------------------------------------

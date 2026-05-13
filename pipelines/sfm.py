@@ -48,6 +48,7 @@ from foxglove_schemas_protobuf.FrameTransform_pb2 import FrameTransform
 from foxglove_schemas_protobuf.PackedElementField_pb2 import PackedElementField
 from foxglove_schemas_protobuf.PointCloud_pb2 import PointCloud
 
+from autocal.engine.features import decode_sift_features, encode_sift_features
 from autocal.engine.sfm import SfmOptions, optimize_poses
 from autocal.engine.visualization import write_camera_path
 from autocal.gtsam_bridge.conversions import (
@@ -55,9 +56,9 @@ from autocal.gtsam_bridge.conversions import (
     frame_transform_from_pose3,
     pose3_from_frame_transform,
 )
-from autocal.io.mcap_reader import get_topic_map, iter_messages, load_sift_features
+from autocal.io.mcap_reader import get_topic_map, iter_messages
 from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
-from autocal.metrics.ape import compute_ape
+from autocal.metrics.ape import ApePoseMsg, ApeSummaryMsg, compute_ape
 from autocal.optics.camera import overlay_keypoints
 
 CAMERA_IMAGE_TOPIC = "/camera/image"
@@ -192,7 +193,9 @@ def main() -> None:
     preloaded_features = None
     if SIFT_FEATURES_TOPIC in topics:
         print(f"Loading cached SIFT features from {SIFT_FEATURES_TOPIC}...", flush=True)
-        preloaded_features = load_sift_features(args.input, topic=SIFT_FEATURES_TOPIC)
+        preloaded_features = {}
+        for _, t_ns, msg in iter_messages(args.input, topics=[SIFT_FEATURES_TOPIC]):
+            preloaded_features[t_ns] = decode_sift_features(msg)
         print(f"  Loaded features for {len(preloaded_features)} images", flush=True)
 
     t_start = time.time()
@@ -269,39 +272,31 @@ def main() -> None:
         )
 
         # Per-frame APE (only present when GT poses were in the input MCAP)
-        _ape_fields = {"translation_m": "number", "rotation_deg": "number"}
         for t_ns, (t_err, r_err) in ape_by_ts.items():
-            writer.write_json(APE_TOPIC, _ape_fields,
-                              {"translation_m": t_err, "rotation_deg": r_err}, t_ns)
+            writer.write_json(APE_TOPIC,
+                              ApePoseMsg(translation_m=t_err, rotation_deg=r_err), t_ns)
 
         # APE summary statistics — single message at the start timestamp
         if ape_by_ts:
             s = ape_result["stats"]
-            _summary_fields = {
-                "trans_mean_m":   "number", "trans_median_m": "number",
-                "trans_max_m":    "number", "trans_rmse_m":   "number",
-                "rot_mean_deg":   "number", "rot_median_deg": "number",
-                "rot_max_deg":    "number", "rot_rmse_deg":   "number",
-                "n_poses":        "integer",
-            }
-            writer.write_json(APE_SUMMARY_TOPIC, _summary_fields, {
-                "trans_mean_m":   s["translation"]["mean"],
-                "trans_median_m": s["translation"]["median"],
-                "trans_max_m":    s["translation"]["max"],
-                "trans_rmse_m":   s["translation"]["rmse"],
-                "rot_mean_deg":   s["rotation"]["mean"],
-                "rot_median_deg": s["rotation"]["median"],
-                "rot_max_deg":    s["rotation"]["max"],
-                "rot_rmse_deg":   s["rotation"]["rmse"],
-                "n_poses":        ape_result["n_poses"],
-            }, raw_images[0][0])
+            writer.write_json(APE_SUMMARY_TOPIC, ApeSummaryMsg(
+                trans_mean_m=s["translation"]["mean"],
+                trans_median_m=s["translation"]["median"],
+                trans_max_m=s["translation"]["max"],
+                trans_rmse_m=s["translation"]["rmse"],
+                rot_mean_deg=s["rotation"]["mean"],
+                rot_median_deg=s["rotation"]["median"],
+                rot_max_deg=s["rotation"]["max"],
+                rot_rmse_deg=s["rotation"]["rmse"],
+                n_poses=ape_result["n_poses"],
+            ), raw_images[0][0])
 
         # SIFT features — write for downstream reuse (cached from input or freshly detected)
         for t_ns, _ in raw_images:
             if t_ns in keypoints and t_ns in descriptors:
-                writer.write_sift_features(
-                    SIFT_FEATURES_TOPIC, keypoints[t_ns], descriptors[t_ns], t_ns
-                )
+                writer.write_json(SIFT_FEATURES_TOPIC,
+                                  encode_sift_features(keypoints[t_ns], descriptors[t_ns]),
+                                  t_ns)
 
     size_mb = Path(args.output).stat().st_size / 1e6
     print(f"Wrote {args.output}  ({size_mb:.1f} MB)")

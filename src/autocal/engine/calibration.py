@@ -87,6 +87,7 @@ from autocal.gtsam_bridge.conversions import (
 )
 from autocal.io.mcap_reader import get_topic_map, iter_messages
 from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
+from autocal.engine.calibration_msgs import CalibrationDeltaMsg, PoseErrorMsg
 from autocal.engine.visualization import write_camera_path
 from autocal.optics.camera import overlay_keypoints
 
@@ -581,43 +582,32 @@ class CalibrationEngine:
                 cal=opt_cal,
             )
 
-            _POSE_ERR_FIELDS = {"position_error_m": "number"}
             for t_ns, pose in opt_poses.items():
                 if t_ns in initial_poses:
                     err_m = float(np.linalg.norm(
                         pose.translation() - initial_poses[t_ns].translation()
                     ))
-                    writer.write_json(OUT_POSE_ERROR_TOPIC, _POSE_ERR_FIELDS,
-                                      {"position_error_m": err_m}, t_ns)
+                    writer.write_json(OUT_POSE_ERROR_TOPIC,
+                                      PoseErrorMsg(position_error_m=err_m), t_ns)
 
-            _CAL_DELTA_FIELDS = {k: "number" for k in (
-                "fx_initial", "fx_optimized", "fx_delta",
-                "fy_initial", "fy_optimized", "fy_delta",
-                "cx_initial", "cx_optimized", "cx_delta",
-                "cy_initial", "cy_optimized", "cy_delta",
-                "k1_initial", "k1_optimized", "k1_delta",
-                "k2_initial", "k2_optimized", "k2_delta",
-                "p1_initial", "p1_optimized", "p1_delta",
-                "p2_initial", "p2_optimized", "p2_delta",
-            )}
-            writer.write_json(OUT_CAL_DELTA_TOPIC, _CAL_DELTA_FIELDS, {
-                "fx_initial":   cal.fx(),      "fx_optimized": opt_cal.fx(),
-                "fx_delta":     opt_cal.fx()  - cal.fx(),
-                "fy_initial":   cal.fy(),      "fy_optimized": opt_cal.fy(),
-                "fy_delta":     opt_cal.fy()  - cal.fy(),
-                "cx_initial":   cal.px(),      "cx_optimized": opt_cal.px(),
-                "cx_delta":     opt_cal.px()  - cal.px(),
-                "cy_initial":   cal.py(),      "cy_optimized": opt_cal.py(),
-                "cy_delta":     opt_cal.py()  - cal.py(),
-                "k1_initial":   cal.k1(),      "k1_optimized": opt_cal.k1(),
-                "k1_delta":     opt_cal.k1()  - cal.k1(),
-                "k2_initial":   cal.k2(),      "k2_optimized": opt_cal.k2(),
-                "k2_delta":     opt_cal.k2()  - cal.k2(),
-                "p1_initial":   float(cal.k()[2]),      "p1_optimized": float(opt_cal.k()[2]),
-                "p1_delta":     float(opt_cal.k()[2])  - float(cal.k()[2]),
-                "p2_initial":   float(cal.k()[3]),      "p2_optimized": float(opt_cal.k()[3]),
-                "p2_delta":     float(opt_cal.k()[3])  - float(cal.k()[3]),
-            }, t0_ns)
+            writer.write_json(OUT_CAL_DELTA_TOPIC, CalibrationDeltaMsg(
+                fx_initial=cal.fx(),           fx_optimized=opt_cal.fx(),
+                fx_delta=opt_cal.fx()         - cal.fx(),
+                fy_initial=cal.fy(),           fy_optimized=opt_cal.fy(),
+                fy_delta=opt_cal.fy()         - cal.fy(),
+                cx_initial=cal.px(),           cx_optimized=opt_cal.px(),
+                cx_delta=opt_cal.px()         - cal.px(),
+                cy_initial=cal.py(),           cy_optimized=opt_cal.py(),
+                cy_delta=opt_cal.py()         - cal.py(),
+                k1_initial=cal.k1(),           k1_optimized=opt_cal.k1(),
+                k1_delta=opt_cal.k1()         - cal.k1(),
+                k2_initial=cal.k2(),           k2_optimized=opt_cal.k2(),
+                k2_delta=opt_cal.k2()         - cal.k2(),
+                p1_initial=float(cal.k()[2]),  p1_optimized=float(opt_cal.k()[2]),
+                p1_delta=float(opt_cal.k()[2]) - float(cal.k()[2]),
+                p2_initial=float(cal.k()[3]),  p2_optimized=float(opt_cal.k()[3]),
+                p2_delta=float(opt_cal.k()[3]) - float(cal.k()[3]),
+            ), t0_ns)
 
         return {
             "calibration": opt_cal,
