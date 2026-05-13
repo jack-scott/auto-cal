@@ -38,11 +38,12 @@ from autocal.gtsam_bridge.conversions import (
     frame_transform_from_pose3,
     pose3_from_frame_transform,
 )
-from autocal.io.mcap_reader import get_topic_map, iter_messages
+from autocal.io.mcap_reader import get_topic_map, iter_messages, load_sift_features
 from autocal.io.mcap_writer import McapWriter
 
-TF_TOPIC  = "/tf"
-CAL_TOPIC = "/camera/calibration"
+TF_TOPIC            = "/tf"
+CAL_TOPIC           = "/camera/calibration"
+SIFT_FEATURES_TOPIC = "/camera/sift_features"
 
 
 def _perturb_pose(
@@ -123,9 +124,14 @@ def main() -> None:
 
     n_passed = n_modified = n_dropped = 0
 
+    # Separate JSON topics (sift_features) from protobuf topics so each can be
+    # handled with the appropriate reader API (iter_decoded_messages can't decode JSON).
+    proto_topics = [t for t in topics if t != SIFT_FEATURES_TOPIC]
+
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with McapWriter(args.output) as writer:
-        for topic, t_ns, msg in iter_messages(args.input):
+        # --- protobuf topics (images, calibration, tf, ...) ---
+        for topic, t_ns, msg in iter_messages(args.input, topics=proto_topics):
             if topic == TF_TOPIC:
                 if args.remove_poses:
                     n_dropped += 1
@@ -151,6 +157,14 @@ def main() -> None:
             else:
                 writer.write(topic, msg, t_ns)
                 n_passed += 1
+
+        # --- JSON topics: pass sift features through unchanged ---
+        if SIFT_FEATURES_TOPIC in topics:
+            features = load_sift_features(args.input, topic=SIFT_FEATURES_TOPIC)
+            for t_ns, (kps, descs) in features.items():
+                writer.write_sift_features(SIFT_FEATURES_TOPIC, kps, descs, t_ns)
+            n_passed += len(features)
+            print(f"Passed through {len(features)} cached SIFT feature messages")
 
     size_mb = Path(args.output).stat().st_size / 1e6
     print(f"\nMessages: {n_passed} passed  {n_modified} modified  {n_dropped} dropped")

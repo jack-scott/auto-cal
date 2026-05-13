@@ -27,6 +27,7 @@ Pipeline
 
 from __future__ import annotations
 
+import re as _re
 import cv2
 import gtsam
 import numpy as np
@@ -219,6 +220,7 @@ def optimize_poses(
     # Uses distorted pixel observations so the calibration model is applied
     # correctly; all visible cameras contribute (not just the first 2).
     # ------------------------------------------------------------------ #
+    tracks = build_tracks(matches_per_pair)
     _triangulate_gtsam(tracks, keypoints, calibration, poses, id_to_idx,
                        max_dist=opts.max_landmark_dist_m,
                        min_parallax_deg=opts.min_parallax_deg)
@@ -238,75 +240,24 @@ def optimize_poses(
     )
 
     # ------------------------------------------------------------------ #
-    # GTSAM factor graph
-    # ------------------------------------------------------------------ #
-    graph = gtsam.NonlinearFactorGraph()
-    initial_values = gtsam.Values()
-
-    X = gtsam.symbol_shorthand.X
-    P = gtsam.symbol_shorthand.P
-
-    for img_id, pose in poses.items():
-        initial_values.insert(X(id_to_idx[img_id]), pose)
-
-    if has_priors:
-        pose_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
-            opts.pose_noise_rad, opts.pose_noise_rad, opts.pose_noise_rad,
-            opts.pose_noise_m, opts.pose_noise_m, opts.pose_noise_m,
-        ]))
-        for img_id, pose in initial_poses.items():
-            graph.add(gtsam.PriorFactorPose3(X(id_to_idx[img_id]), pose, pose_noise))
-    else:
-        # Fix frame 0 as the gauge (tight prior, no external reference)
-        fixed_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
-            1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6,
-        ]))
-        graph.add(gtsam.PriorFactorPose3(X(0), poses[img_ids[0]], fixed_noise))
-
-    base_noise = gtsam.noiseModel.Isotropic.Sigma(2, opts.pixel_noise_px)
-    if opts.huber_loss:
-        pixel_noise = gtsam.noiseModel.Robust.Create(
-            gtsam.noiseModel.mEstimator.Huber.Create(opts.pixel_noise_px),
-            base_noise,
-        )
-    else:
-        pixel_noise = base_noise
-    for j, track in enumerate(triangulated):
-        initial_values.insert(P(j), gtsam.Point3(*track.point3d))
-        for img_id, kp_idx in track.observations.items():
-            if img_id not in id_to_idx:
-                continue
-            kp = keypoints[img_id][kp_idx]
-            measured = np.array([float(kp[0]), float(kp[1])])
-            if _fisheye:
-                graph.add(gtsam.GenericProjectionFactorCal3Fisheye(
-                    measured, pixel_noise,
-                    X(id_to_idx[img_id]), P(j),
-                    calibration,
-                ))
-            else:
-                graph.add(gtsam.GenericProjectionFactorCal3DS2(
-                    measured, pixel_noise,
-                    X(id_to_idx[img_id]), P(j),
-                    calibration,
-                ))
-
-    # ------------------------------------------------------------------ #
-    # Optimise
+    # GTSAM factor graph + optimise (with degenerate-landmark retry)
     # ------------------------------------------------------------------ #
     print(
         f"Optimising ({len(triangulated)} tracks, {len(poses)} cameras)...",
         flush=True,
     )
-    dogleg_params = gtsam.DoglegParams()
-    dogleg_params.setMaxIterations(opts.lm_iterations)
-    optimizer = gtsam.DoglegOptimizer(graph, initial_values, dogleg_params)
-    result = optimizer.optimize()
+    result, graph, initial_values, n_active = _build_and_optimize(
+        triangulated, poses, id_to_idx, img_ids, keypoints,
+        calibration, opts, has_priors,
+        initial_poses if has_priors else None,
+        _fisheye,
+    )
     print(
         f"  Error: {graph.error(initial_values):.3e} → {graph.error(result):.3e}",
         flush=True,
     )
 
+    X = gtsam.symbol_shorthand.X
     opt_poses: dict[int, gtsam.Pose3] = {
         img_id: result.atPose3(X(idx))
         for img_id, idx in id_to_idx.items()
@@ -325,6 +276,127 @@ def optimize_poses(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _build_and_optimize(
+    triangulated: list,
+    poses: dict,
+    id_to_idx: dict,
+    img_ids: list,
+    keypoints: dict,
+    calibration,
+    opts: "SfmOptions",
+    has_priors: bool,
+    initial_poses: dict | None,
+    fisheye: bool,
+    max_retries: int = 50,
+):
+    """Build a GTSAM factor graph and optimize, removing degenerate landmarks on retry.
+
+    When GTSAM throws IndeterminantLinearSystemException it names the offending
+    P-variable in the error message.  We parse that index, drop the landmark from
+    the active set, rebuild the graph (re-numbering P-variables), and retry.  Up
+    to max_retries landmarks can be dropped before the exception is re-raised.
+
+    Returns:
+        (result_values, graph, initial_values, n_active_tracks)
+    """
+    X = gtsam.symbol_shorthand.X
+    P = gtsam.symbol_shorthand.P
+
+    excluded: set[int] = set()   # original indices into `triangulated` to skip
+    pinned: set[int] = set()     # X-variable indices to pin with a tight prior
+    _tight_noise = gtsam.noiseModel.Diagonal.Sigmas(
+        np.array([1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6])
+    )
+
+    for attempt in range(max_retries + 1):
+        active = [(orig_j, t) for orig_j, t in enumerate(triangulated)
+                  if orig_j not in excluded]
+
+        graph = gtsam.NonlinearFactorGraph()
+        iv = gtsam.Values()
+
+        for img_id, pose in poses.items():
+            iv.insert(X(id_to_idx[img_id]), pose)
+
+        if has_priors:
+            pose_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
+                opts.pose_noise_rad, opts.pose_noise_rad, opts.pose_noise_rad,
+                opts.pose_noise_m,   opts.pose_noise_m,   opts.pose_noise_m,
+            ]))
+            for img_id, pose in initial_poses.items():
+                graph.add(gtsam.PriorFactorPose3(X(id_to_idx[img_id]), pose, pose_noise))
+        else:
+            graph.add(gtsam.PriorFactorPose3(X(0), poses[img_ids[0]], _tight_noise))
+
+        # Pin any cameras that became degenerate in a previous attempt.
+        for x_idx in pinned:
+            graph.add(gtsam.PriorFactorPose3(X(x_idx), poses[img_ids[x_idx]], _tight_noise))
+
+        base_noise = gtsam.noiseModel.Isotropic.Sigma(2, opts.pixel_noise_px)
+        if opts.huber_loss:
+            pixel_noise = gtsam.noiseModel.Robust.Create(
+                gtsam.noiseModel.mEstimator.Huber.Create(opts.pixel_noise_px),
+                base_noise,
+            )
+        else:
+            pixel_noise = base_noise
+
+        for new_j, (orig_j, track) in enumerate(active):
+            iv.insert(P(new_j), gtsam.Point3(*track.point3d))
+            for img_id, kp_idx in track.observations.items():
+                if img_id not in id_to_idx:
+                    continue
+                kp = keypoints[img_id][kp_idx]
+                measured = np.array([float(kp[0]), float(kp[1])])
+                if fisheye:
+                    graph.add(gtsam.GenericProjectionFactorCal3Fisheye(
+                        measured, pixel_noise,
+                        X(id_to_idx[img_id]), P(new_j),
+                        calibration,
+                    ))
+                else:
+                    graph.add(gtsam.GenericProjectionFactorCal3DS2(
+                        measured, pixel_noise,
+                        X(id_to_idx[img_id]), P(new_j),
+                        calibration,
+                    ))
+
+        dogleg_params = gtsam.DoglegParams()
+        dogleg_params.setMaxIterations(opts.lm_iterations)
+        optimizer = gtsam.DoglegOptimizer(graph, iv, dogleg_params)
+
+        try:
+            result = optimizer.optimize()
+            if excluded or pinned:
+                print(f"  Removed {len(excluded)} landmark(s), "
+                      f"pinned {len(pinned)} camera(s), "
+                      f"{len(active)} tracks remain", flush=True)
+            return result, graph, iv, len(active)
+        except RuntimeError as exc:
+            if attempt == max_retries:
+                raise
+            err = str(exc)
+            match_p = _re.search(r'Symbol: p(\d+)', err)
+            match_x = _re.search(r'Symbol: x(\d+)', err)
+            if match_p:
+                bad_new_j = int(match_p.group(1))
+                if bad_new_j < len(active):
+                    excluded.add(active[bad_new_j][0])
+                    print(f"  Removing degenerate landmark p{bad_new_j} "
+                          f"(attempt {attempt+1})", flush=True)
+                else:
+                    raise
+            elif match_x:
+                x_idx = int(match_x.group(1))
+                pinned.add(x_idx)
+                print(f"  Pinning degenerate camera x{x_idx} "
+                      f"(attempt {attempt+1})", flush=True)
+            else:
+                raise
+
+    raise RuntimeError("_build_and_optimize: max retries exceeded")
+
 
 def _triangulate_gtsam(
     tracks: list[Track],
