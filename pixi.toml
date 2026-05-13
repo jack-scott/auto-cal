@@ -15,6 +15,7 @@ pyproj = ">=3.7.2,<4"
 [pypi-dependencies]
 piexif = ">=1.1"
 py7zr = ">=0.21"
+evo = ">=1.29"
 foxglove-sdk = ">=0.22"
 foxglove-schemas-protobuf = ">=0.1"
 mcap-protobuf-support = ">=0.5"

@@ -57,6 +57,7 @@ from autocal.gtsam_bridge.conversions import (
 )
 from autocal.io.mcap_reader import get_topic_map, iter_messages, load_sift_features
 from autocal.io.mcap_writer import McapWriter, ns_to_timestamp
+from autocal.metrics.ape import compute_ape
 from autocal.optics.camera import overlay_keypoints
 
 CAMERA_IMAGE_TOPIC = "/camera/image"
@@ -67,6 +68,7 @@ POINTS_TOPIC       = "/points/sfm"
 SCENE_INITIAL_TOPIC   = "/scene/cameras/initial"
 SCENE_OPTIMIZED_TOPIC = "/scene/cameras/optimized"
 APE_TOPIC             = "/ape"
+APE_SUMMARY_TOPIC     = "/ape/summary"
 SIFT_FEATURES_TOPIC   = "/camera/sift_features"
 
 
@@ -205,27 +207,22 @@ def main() -> None:
     triangulated  = result["triangulated"]
     print(f"\nSfM complete in {elapsed:.1f}s  ({result['n_tracks']} tracks)")
 
-    # APE vs GT when ground-truth poses were provided from the input MCAP
+    # APE vs GT (only when /tf was present in the input MCAP)
     ape_by_ts: dict[int, tuple[float, float]] = {}   # t_ns → (translation_m, rotation_deg)
     if tf_msgs:
-        for t_ns, _ in raw_images:
-            if t_ns not in initial_poses or t_ns not in opt_poses:
-                continue
-            gt  = initial_poses[t_ns]
-            est = opt_poses[t_ns]
-            t_err = float(np.linalg.norm(gt.translation() - est.translation()))
-            R_rel = gt.rotation().matrix().T @ est.rotation().matrix()
-            cos_a = float(np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0))
-            r_err = float(np.degrees(np.arccos(cos_a)))
-            ape_by_ts[t_ns] = (t_err, r_err)
+        ape_result = compute_ape(initial_poses, opt_poses)
+        ape_by_ts = ape_result["by_key"]
         if ape_by_ts:
-            t_errs = [v[0] for v in ape_by_ts.values()]
-            r_errs = [v[1] for v in ape_by_ts.values()]
-            print(f"\nAPE vs GT ({len(ape_by_ts)} cameras):")
-            print(f"  Translation (m):  mean={np.mean(t_errs):.4f}  "
-                  f"median={np.median(t_errs):.4f}  max={np.max(t_errs):.4f}")
-            print(f"  Rotation (deg):   mean={np.mean(r_errs):.4f}  "
-                  f"median={np.median(r_errs):.4f}  max={np.max(r_errs):.4f}")
+            s = ape_result["stats"]
+            print(f"\nAPE vs GT ({ape_result['n_poses']} cameras, SE(3)-aligned):")
+            print(f"  Translation (m):  mean={s['translation']['mean']:.4f}  "
+                  f"median={s['translation']['median']:.4f}  "
+                  f"max={s['translation']['max']:.4f}  "
+                  f"rmse={s['translation']['rmse']:.4f}")
+            print(f"  Rotation (deg):   mean={s['rotation']['mean']:.4f}  "
+                  f"median={s['rotation']['median']:.4f}  "
+                  f"max={s['rotation']['max']:.4f}  "
+                  f"rmse={s['rotation']['rmse']:.4f}")
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with McapWriter(args.output) as writer:
@@ -276,6 +273,28 @@ def main() -> None:
         for t_ns, (t_err, r_err) in ape_by_ts.items():
             writer.write_json(APE_TOPIC, _ape_fields,
                               {"translation_m": t_err, "rotation_deg": r_err}, t_ns)
+
+        # APE summary statistics — single message at the start timestamp
+        if ape_by_ts:
+            s = ape_result["stats"]
+            _summary_fields = {
+                "trans_mean_m":   "number", "trans_median_m": "number",
+                "trans_max_m":    "number", "trans_rmse_m":   "number",
+                "rot_mean_deg":   "number", "rot_median_deg": "number",
+                "rot_max_deg":    "number", "rot_rmse_deg":   "number",
+                "n_poses":        "integer",
+            }
+            writer.write_json(APE_SUMMARY_TOPIC, _summary_fields, {
+                "trans_mean_m":   s["translation"]["mean"],
+                "trans_median_m": s["translation"]["median"],
+                "trans_max_m":    s["translation"]["max"],
+                "trans_rmse_m":   s["translation"]["rmse"],
+                "rot_mean_deg":   s["rotation"]["mean"],
+                "rot_median_deg": s["rotation"]["median"],
+                "rot_max_deg":    s["rotation"]["max"],
+                "rot_rmse_deg":   s["rotation"]["rmse"],
+                "n_poses":        ape_result["n_poses"],
+            }, raw_images[0][0])
 
         # SIFT features — write for downstream reuse (cached from input or freshly detected)
         for t_ns, _ in raw_images:
