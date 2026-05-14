@@ -67,36 +67,65 @@ def filter_pairs_by_geometry(
     poses: dict[Any, gtsam.Pose3] | None,
     keypoints_u: dict[Any, np.ndarray] | None = None,
     K: np.ndarray | None = None,
-) -> tuple[dict[tuple[Any, Any], list[tuple[int, int]]], dict[PairClass, int]]:
+    he_secondary_check: bool = True,
+    he_secondary_ratio: float = 0.99,
+) -> tuple[dict[tuple[Any, Any], list[tuple[int, int]]], dict[PairClass, int], int]:
     """Filter pair matches by geometric classification, dropping degenerate pairs.
 
     Uses classify_pair_with_poses when poses are provided (fast, accurate).
     Falls back to classify_pair_without_poses (H/E ratio test) otherwise.
 
+    When poses are provided and he_secondary_check=True, also runs the H/E ratio
+    test on pairs the pose classifier accepts.  This catches near-duplicate pairs
+    whose true baseline is smaller than the pose noise (e.g. σ_t=100mm > 0.2mm
+    true baseline), where the pose classifier is effectively blind.
+
     STATIC and PURE_ROTATION pairs are dropped.  PURE_ROTATION dropping is
     conservative — reprojection-only factor insertion is future work.
 
     Args:
-        matches_per_pair: {(id_a, id_b): [(i, j), ...]} as returned after RANSAC.
-        poses:            Pose priors {img_id: Pose3}, or None for image-only path.
-        keypoints_u:      Undistorted keypoints {img_id: array}.  Required if poses is None.
-        K:                3×3 intrinsic matrix.  Required if poses is None.
+        matches_per_pair:   {(id_a, id_b): [(i, j), ...]} as returned after RANSAC.
+        poses:              Pose priors {img_id: Pose3}, or None for image-only path.
+        keypoints_u:        Undistorted keypoints {img_id: array}.  Required if poses
+                            is None, or for he_secondary_check.
+        K:                  3×3 intrinsic matrix.  Required if poses is None, or for
+                            he_secondary_check.
+        he_secondary_check: When True and poses are provided, run the H/E ratio test
+                            as a secondary check on pairs that pass the pose classifier.
+                            Requires keypoints_u and K.  Default True.
+        he_secondary_ratio: H/E inlier ratio threshold used for the secondary check.
+                            Should be stricter than the standalone default (0.8) because
+                            the secondary check targets only true near-duplicates (ratio ≈ 1.0)
+                            where pose noise hides the zero baseline.  Default 0.99.
 
     Returns:
-        (filtered_pairs, counts) where counts maps each PairClass to the number of
-        pairs assigned to it before filtering.
+        (filtered_pairs, counts, n_he_override) where counts maps each PairClass to
+        the number of pairs assigned to it, and n_he_override is the count of pairs
+        that passed the pose classifier but were rejected by the H/E secondary check.
     """
     if poses is None and (keypoints_u is None or K is None):
         raise ValueError(
             "filter_pairs_by_geometry: provide either poses or both keypoints_u and K"
         )
 
+    _he_available = keypoints_u is not None and K is not None
     counts: dict[PairClass, int] = {c: 0 for c in PairClass}
     filtered: dict[tuple[Any, Any], list[tuple[int, int]]] = {}
+    n_he_override = 0
 
     for (id_a, id_b), m in matches_per_pair.items():
         if poses is not None:
             cls = classify_pair_with_poses(poses[id_a], poses[id_b])
+            if (he_secondary_check
+                    and _he_available
+                    and cls not in (PairClass.STATIC, PairClass.PURE_ROTATION)):
+                he_cls = classify_pair_without_poses(
+                    keypoints_u[id_a], keypoints_u[id_b], m, K,
+                    degenerate_ratio=he_secondary_ratio,
+                )
+                if he_cls in (PairClass.STATIC, PairClass.PURE_ROTATION):
+                    cls = he_cls
+                    n_he_override += 1
         else:
             cls = classify_pair_without_poses(keypoints_u[id_a], keypoints_u[id_b], m, K)
         counts[cls] += 1
@@ -104,7 +133,7 @@ def filter_pairs_by_geometry(
             continue  # PURE_ROTATION: future work — reprojection-only factors
         filtered[(id_a, id_b)] = m
 
-    return filtered, counts
+    return filtered, counts, n_he_override
 
 
 def classify_pair_without_poses(

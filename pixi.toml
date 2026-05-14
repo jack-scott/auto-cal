@@ -84,8 +84,8 @@ depends-on = ["eth3d-exhibition-hall-sfm"]
 #   easy   σ_t=5mm   σ_R=0.2°  — pair classifier detects static frames from poses alone
 #   medium σ_t=20mm  σ_R=0.6°  — pose noise larger than the 0.2mm static-pair baseline;
 #                                 classifier misses 61-62/63-64 → H/E secondary check needed
-#   hard   σ_t=100mm σ_R=2.9°  — existing noisy level; optimiser currently makes APE worse
-#                                 because static pairs contaminate the graph
+#   hard   σ_t=100mm σ_R=2.9°  — pose noise >> static-pair baseline; H/E disabled (camera
+#                                 isolation worse than junk tracks); APE currently degrades
 
 # easy — pose classifier catches degenerate pairs, fine preset matches noise level
 [tasks.eth3d-exhibition-hall-noise-easy-perturb]
@@ -105,7 +105,7 @@ cmd = ["python", "pipelines/sfm.py",
        "--pose-noise-rad", "0.002",
        "--min-parallax-deg", "2",
        "--reproj-filter-px", "8",
-       "--post-reproj-px", "0"]
+       "--post-reproj-pct", "0"]
 depends-on = ["eth3d-exhibition-hall-noise-easy-perturb"]
 
 # medium — σ_t > static-pair baseline; classifier falls back to H/E test
@@ -125,27 +125,27 @@ cmd = ["python", "pipelines/sfm.py",
        "--pose-noise-m", "0.02",
        "--pose-noise-rad", "0.01",
        "--min-parallax-deg", "2",
-       "--post-reproj-px", "0"]
+       "--post-reproj-pct", "0"]
 depends-on = ["eth3d-exhibition-hall-noise-medium-perturb"]
 
-# hard — existing noisy level; kept for backward compatibility
-[tasks.eth3d-exhibition-hall-perturb]
+# hard — σ_t=100mm, σ_R=2.9°
+[tasks.eth3d-exhibition-hall-noise-hard-perturb]
 cmd = ["python", "tools/perturb_mcap.py",
        "data/eth3d_exhibition_hall.mcap",
-       "data/eth3d_exhibition_hall_noisy.mcap",
+       "data/eth3d_exhibition_hall_noise_hard.mcap",
        "--pose-noise-m", "0.1",
        "--pose-noise-rad", "0.05"]
 depends-on = ["eth3d-exhibition-hall-prepare"]
 
-[tasks.eth3d-exhibition-hall-noisy-sfm]
+[tasks.eth3d-exhibition-hall-noise-hard-sfm]
 cmd = ["python", "pipelines/sfm.py",
-       "data/eth3d_exhibition_hall_noisy.mcap",
-       "data/eth3d_exhibition_hall_noisy_sfm.mcap",
-       "--reproj-filter-px", "0",
+       "data/eth3d_exhibition_hall_noise_hard.mcap",
+       "data/eth3d_exhibition_hall_noise_hard_sfm.mcap",
+       "--preset", "hard",
        "--max-landmark-dist", "100",
        "--min-parallax-deg", "2",
-       "--huber-loss"]
-depends-on = ["eth3d-exhibition-hall-perturb"]
+       "--no-he-secondary-check"]
+depends-on = ["eth3d-exhibition-hall-noise-hard-perturb"]
 
 # ---------------------------------------------------------------------------
 # Caliterra — UAV nadir survey (Canon SX260 HS, GPS)

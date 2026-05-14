@@ -14,6 +14,8 @@ poses), runs visual SfM (essential-matrix chaining or pose-prior initialisation
   /scene/cameras/optimized post-optimisation camera frustums + path (green)
   /ape                     per-frame APE vs GT (only when /tf present in input)
                              fields: translation_m, rotation_deg
+  /sfm/track_stats         track length statistics: n_tracks, mean/median/max length,
+                             per-length counts (n_len_3, n_len_4, n_len_5plus)
 
 If /tf is present in the input MCAP the poses are used as initial values and
 soft priors, bypassing essential-matrix chaining.
@@ -39,8 +41,10 @@ Options:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import gtsam
@@ -76,6 +80,19 @@ APE_INIT_SUMMARY      = "/ape/initial/summary"
 APE_OPT_TOPIC         = "/ape/optimized"
 APE_OPT_SUMMARY       = "/ape/optimized/summary"
 SIFT_FEATURES_TOPIC   = "/camera/sift_features"
+TRACK_STATS_TOPIC     = "/sfm/track_stats"
+
+
+@dataclasses.dataclass
+class TrackStatsMsg:
+    """Track length statistics written to /sfm/track_stats."""
+    n_tracks:     int
+    mean_length:  float
+    median_length: float
+    max_length:   int
+    n_len_3:      int
+    n_len_4:      int
+    n_len_5plus:  int
 
 
 _DEFAULTS: dict = {
@@ -92,9 +109,11 @@ _DEFAULTS: dict = {
     "min_parallax_deg": 1.0,
     "huber_loss":       False,
     "ransac_threshold":  2.0,
-    "min_track_length":    3,
-    "match_window":        3,
-    "post_reproj_error_px": 5.0,
+    "min_track_length":       3,
+    "match_window":           3,
+    "post_reproj_reject_pct": 0.0,
+    "post_reproj_iters":      4,
+    "he_secondary_check":     True,
     "ignore_poses":        False,
 }
 
@@ -116,6 +135,19 @@ PRESETS: dict[str, dict] = {
         "pose_noise_m":     0.2,
         "pose_noise_rad":   0.05,
         "reproj_filter_px": 20.0,
+        "pixel_noise_px":   1.5,
+        "min_parallax_deg": 1.0,
+        "huber_loss":       True,
+        "max_tracks":       2000,
+    },
+    "hard": {
+        # Large pose noise (σ_t ≈ 5–15 cm, σ_R ≈ 2–5°).  Translation prior
+        # matches expected noise; rotation prior intentionally tight (0.01 rad)
+        # to act as a regularizer against junk landmarks from degenerate pairs.
+        # No pre-opt reproj filter; Huber loss for robustness.
+        "pose_noise_m":     0.1,
+        "pose_noise_rad":   0.01,
+        "reproj_filter_px": 0.0,
         "pixel_noise_px":   1.5,
         "min_parallax_deg": 1.0,
         "huber_loss":       True,
@@ -143,6 +175,29 @@ PRESETS: dict[str, dict] = {
         "max_tracks":       2000,
     },
 }
+
+
+def _print_track_stats(lengths: list[int]) -> TrackStatsMsg:
+    """Print a compact track-length histogram and return a TrackStatsMsg."""
+    if not lengths:
+        return TrackStatsMsg(0, 0.0, 0.0, 0, 0, 0, 0)
+    c = Counter(lengths)
+    n = len(lengths)
+    mean   = sum(lengths) / n
+    median = float(sorted(lengths)[n // 2])
+    mx     = max(lengths)
+    n3     = c.get(3, 0)
+    n4     = c.get(4, 0)
+    n5p    = sum(v for k, v in c.items() if k >= 5)
+    print(f"Track lengths: mean={mean:.1f}  median={median:.0f}  max={mx}")
+    parts = []
+    for k in sorted(c):
+        parts.append(f"  len={k}: {c[k]} ({100*c[k]/n:.0f}%)")
+    print("".join(parts))
+    return TrackStatsMsg(
+        n_tracks=n, mean_length=round(mean, 2), median_length=median,
+        max_length=mx, n_len_3=n3, n_len_4=n4, n_len_5plus=n5p,
+    )
 
 
 def main() -> None:
@@ -187,9 +242,17 @@ def main() -> None:
     parser.add_argument("--match-window", type=int, default=None,
                         help="Match each frame against this many following frames (default 3). "
                              "1 = sequential only.")
-    parser.add_argument("--post-reproj-px", type=float, default=None,
-                        help="After optimisation, remove tracks whose max reprojection error "
-                             "exceeds this threshold and re-optimise. Default 2.0px. 0=disabled.")
+    parser.add_argument("--post-reproj-pct", type=float, default=None,
+                        help="After optimisation, iteratively reject the worst fraction of tracks "
+                             "by reprojection error and re-optimise. E.g. 0.1 rejects the worst "
+                             "10%% each iteration. 0=disabled (default).")
+    parser.add_argument("--post-reproj-iters", type=int, default=None,
+                        help="Number of iterative post-optimisation rejection rounds (default 4).")
+    parser.add_argument("--no-he-secondary-check", action="store_false", dest="he_secondary_check",
+                        default=None,
+                        help="Disable H/E ratio secondary check. By default, pairs that pass the "
+                             "pose classifier are also checked image-based to catch near-duplicates "
+                             "under high pose noise.")
     args = parser.parse_args()
 
     # Apply preset first, then explicit CLI flags override, then fall back to _DEFAULTS.
@@ -210,9 +273,11 @@ def main() -> None:
         "min_parallax_deg": args.min_parallax_deg,
         "huber_loss":       args.huber_loss if args.huber_loss else None,
         "ransac_threshold":     args.ransac_threshold,
-        "min_track_length":     args.min_track_length,
-        "match_window":         args.match_window,
-        "post_reproj_error_px": args.post_reproj_px,
+        "min_track_length":       args.min_track_length,
+        "match_window":           args.match_window,
+        "post_reproj_reject_pct": args.post_reproj_pct,
+        "post_reproj_iters":      args.post_reproj_iters,
+        "he_secondary_check":     args.he_secondary_check,
         "ignore_poses":         True if args.ignore_poses else None,
     }
     for k, v in cli_overrides.items():
@@ -282,7 +347,9 @@ def main() -> None:
         ransac_threshold=effective["ransac_threshold"],
         min_track_length=effective["min_track_length"],
         match_window=effective["match_window"],
-        post_reproj_error_px=effective["post_reproj_error_px"],
+        post_reproj_reject_pct=effective["post_reproj_reject_pct"],
+        post_reproj_iters=effective["post_reproj_iters"],
+        he_secondary_check=effective["he_secondary_check"],
     )
 
     images = [(t_ns, bytes(msg.data)) for t_ns, msg in raw_images]
@@ -316,7 +383,9 @@ def main() -> None:
     keypoints     = result["keypoints"]
     descriptors   = result["descriptors"]
     triangulated  = result["triangulated"]
+    track_lengths = result["track_lengths"]
     print(f"\nSfM complete in {elapsed:.1f}s  ({result['n_tracks']} tracks)")
+    track_stats = _print_track_stats(track_lengths)
 
     # Build GT poses from /tf_gt if present
     gt_poses: dict[int, gtsam.Pose3] | None = None
@@ -425,6 +494,8 @@ def main() -> None:
             _write_ape(APE_INIT_TOPIC, APE_INIT_SUMMARY, ape_init_result)
         if ape_opt_result.get("by_key"):
             _write_ape(APE_OPT_TOPIC, APE_OPT_SUMMARY, ape_opt_result)
+
+        writer.write(TRACK_STATS_TOPIC, track_stats, raw_images[0][0])
 
         # SIFT features — write for downstream reuse (cached from input or freshly detected)
         for t_ns, _ in raw_images:

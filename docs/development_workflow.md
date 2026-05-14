@@ -28,11 +28,11 @@ pixi run eth3d-exhibition-hall-prepare
 
 ### Noise levels — run in order (easy → medium → hard)
 
-| Task | σ_t | σ_R | Notes |
-|------|-----|-----|-------|
-| `eth3d-exhibition-hall-noise-easy-sfm` | 5 mm | 0.11° | pose classifier catches degenerate pairs |
-| `eth3d-exhibition-hall-noise-medium-sfm` | 20 mm | 0.57° | σ_t > 0.2mm baseline; classifier partially blind |
-| `eth3d-exhibition-hall-noisy-sfm` | 100 mm | 2.87° | classifier completely blind; H/E fallback needed |
+| Task | Preset | σ_t | σ_R | Notes |
+|------|--------|-----|-----|-------|
+| `eth3d-exhibition-hall-noise-easy-sfm` | `fine` | 5 mm | 0.11° | pose classifier catches degenerate pairs |
+| `eth3d-exhibition-hall-noise-medium-sfm` | `medium` | 20 mm | 0.57° | σ_t > 0.2mm baseline; classifier partially blind |
+| `eth3d-exhibition-hall-noise-hard-sfm` | `hard` | 100 mm | 2.87° | H/E disabled; APE currently degrades |
 
 Each task auto-runs the perturb step first (via `depends-on`).
 
@@ -192,6 +192,21 @@ If APE *increases* after optimisation, common causes:
 1. Noisy initial triangulations (too many bad landmarks) — tighten pre-opt reproj filter
 2. Degenerate pairs not being filtered — their cameras end up with almost no constraints
 3. Huber loss disabled — for hard noise, `--huber-loss` limits the influence of large residuals
+
+---
+
+## Presets
+
+| Preset | `pose_noise_m` | `pose_noise_rad` | `reproj_filter_px` | `huber_loss` | Use when |
+|--------|---------------|-----------------|-------------------|--------------|----------|
+| `fine` | 0.05 | 0.005 | 4.0 | off | σ_t < 5 cm, accurate priors |
+| `medium` | 0.2 | 0.05 | 20.0 | on | σ_t ~10–20 cm |
+| `hard` | 0.1 | 0.01* | 0.0 | on | σ_t ~5–15 cm, many degenerate pairs |
+| `rough` | 1.0 | 0.2 | 0.0 | on | σ_t > 50 cm, very rough priors |
+| `no_pose` | — | — | 0.0 | on | no pose priors, chain from E-matrix |
+
+*`hard` rotation prior is intentionally tight — acts as regularizer against junk landmarks
+from near-duplicate pairs when H/E secondary check is disabled.
 
 ---
 

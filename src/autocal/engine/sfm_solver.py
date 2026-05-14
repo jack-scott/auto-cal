@@ -43,6 +43,7 @@ from autocal.engine.features import (
     filter_by_reproj,
     filter_matches_ransac,
     match_sift,
+    max_reproj_error,
     triangulate_gtsam,
     undistort_keypoints,
 )
@@ -66,9 +67,12 @@ class SfmOptions:
     huber_loss: bool = False
     ransac_threshold: float = 2.0
     classify_pairs: bool = True
+    he_secondary_check: bool = True
+    he_secondary_ratio: float = 0.99
     min_track_length: int = 3
     match_window: int = 3
-    post_reproj_error_px: float = 5.0
+    post_reproj_reject_pct: float = 0.0
+    post_reproj_iters: int = 4
 
 
 def optimize_poses(
@@ -178,17 +182,20 @@ def optimize_poses(
     # ------------------------------------------------------------------ #
     has_priors = initial_poses is not None
     if opts.classify_pairs:
-        matches_per_pair, cls_counts = filter_pairs_by_geometry(
+        matches_per_pair, cls_counts, n_he = filter_pairs_by_geometry(
             matches_per_pair,
             initial_poses if has_priors else None,
             keypoints_for_geo,
             K,
+            he_secondary_check=opts.he_secondary_check,
+            he_secondary_ratio=opts.he_secondary_ratio,
         )
         n_dropped = cls_counts[PairClass.STATIC] + cls_counts[PairClass.PURE_ROTATION]
         if n_dropped > 0:
+            he_note = f" ({n_he} via H/E check)" if n_he > 0 else ""
             print(
                 f"  Pair classification: dropped {cls_counts[PairClass.STATIC]} STATIC "
-                f"+ {cls_counts[PairClass.PURE_ROTATION]} PURE_ROTATION, "
+                f"+ {cls_counts[PairClass.PURE_ROTATION]} PURE_ROTATION{he_note}, "
                 f"{len(matches_per_pair)} pairs remain",
                 flush=True,
             )
@@ -264,44 +271,64 @@ def optimize_poses(
     }
 
     # ------------------------------------------------------------------ #
-    # Post-optimisation outlier rejection + re-optimise
+    # Post-optimisation iterative outlier rejection + re-optimise
+    # Each iteration rejects the worst post_reproj_reject_pct fraction of
+    # tracks by max reprojection error, then warm-starts the next BA pass.
+    # Percentage-based rejection scales with the noise level automatically.
     # ------------------------------------------------------------------ #
-    if opts.post_reproj_error_px > 0:
-        clean = filter_by_reproj(
-            triangulated, keypoints, opt_poses, calibration,
-            opts.post_reproj_error_px,
-        )
-        n_rejected = len(triangulated) - len(clean)
-        if n_rejected > 0 and len(clean) > 0:
+    if opts.post_reproj_reject_pct > 0:
+        current_tracks = triangulated
+        current_poses = opt_poses
+        for iteration in range(opts.post_reproj_iters):
+            if not current_tracks:
+                break
+            errors = [
+                max_reproj_error(t, keypoints, current_poses, calibration)
+                for t in current_tracks
+            ]
+            n_reject = max(1, int(len(current_tracks) * opts.post_reproj_reject_pct))
+            if n_reject >= len(current_tracks):
+                break
+            order = sorted(range(len(errors)), key=lambda j: errors[j], reverse=True)
+            reject_set = set(order[:n_reject])
+            clean = [t for j, t in enumerate(current_tracks) if j not in reject_set]
+            worst_rejected = errors[order[0]]
+            worst_kept     = errors[order[n_reject]]
             print(
-                f"  Post-opt: {n_rejected} tracks rejected "
-                f"(reproj>{opts.post_reproj_error_px:.1f}px), "
+                f"  Post-opt iter {iteration + 1}/{opts.post_reproj_iters}: "
+                f"rejected {n_reject} worst tracks "
+                f"({opts.post_reproj_reject_pct:.0%}, "
+                f"max reproj {worst_rejected:.1f}px → kept ≤{worst_kept:.1f}px), "
                 f"re-optimising on {len(clean)}...",
                 flush=True,
             )
             result, graph, initial_values, _ = _build_and_optimize(
-                clean, opt_poses, id_to_idx, img_ids, keypoints,
+                clean, current_poses, id_to_idx, img_ids, keypoints,
                 calibration, opts, has_priors,
                 initial_poses if has_priors else None,
                 _fisheye,
             )
             print(
-                f"  Error: {graph.error(initial_values):.3e} → {graph.error(result):.3e}",
+                f"    Error: {graph.error(initial_values):.3e} → {graph.error(result):.3e}",
                 flush=True,
             )
-            opt_poses = {
+            current_poses = {
                 img_id: result.atPose3(X(idx))
                 for img_id, idx in id_to_idx.items()
             }
-            triangulated = clean
+            current_tracks = clean
+        opt_poses = current_poses
+        triangulated = current_tracks
 
+    track_lengths = [len(t.observations) for t in triangulated]
     return {
-        "poses":         opt_poses,
-        "initial_poses": poses,
-        "n_tracks":      len(triangulated),
-        "keypoints":     keypoints,
-        "descriptors":   descriptors,
-        "triangulated":  triangulated,
+        "poses":          opt_poses,
+        "initial_poses":  poses,
+        "n_tracks":       len(triangulated),
+        "track_lengths":  track_lengths,
+        "keypoints":      keypoints,
+        "descriptors":    descriptors,
+        "triangulated":   triangulated,
     }
 
 

@@ -1,9 +1,10 @@
 """
-Tests for post-optimisation outlier rejection in optimize_poses.
+Tests for post-optimisation iterative outlier rejection in optimize_poses.
 
 Verifies:
-  - post_reproj_error_px=0 disables the second pass entirely.
-  - A tight threshold removes tracks with high reprojection error.
+  - post_reproj_reject_pct=0 disables the second pass entirely.
+  - A higher rejection percentage keeps fewer tracks.
+  - One iteration of X% rejection removes approximately X% of tracks.
   - Re-optimisation runs and produces a valid pose result.
   - With noisy poses, post-opt rejection improves or matches APE vs no rejection.
 """
@@ -16,7 +17,6 @@ import gtsam
 import numpy as np
 import pytest
 
-from autocal.engine.features import filter_by_reproj
 from autocal.engine.sfm_solver import SfmOptions, optimize_poses
 from autocal.gtsam_bridge.conversions import (
     calibration_from_mcap_msg,
@@ -52,7 +52,8 @@ def five_frames():
 
 
 class TestPostReproj:
-    def _run(self, five_frames, post_reproj: float) -> dict:
+    def _run(self, five_frames, post_reproj_pct: float = 0.0,
+             post_reproj_iters: int = 4) -> dict:
         img_list, poses, cal = five_frames
         opts = SfmOptions(
             sift_features=500,
@@ -60,52 +61,45 @@ class TestPostReproj:
             classify_pairs=False,
             match_window=3,
             min_track_length=2,
-            post_reproj_error_px=post_reproj,
+            post_reproj_reject_pct=post_reproj_pct,
+            post_reproj_iters=post_reproj_iters,
         )
         return optimize_poses(img_list, cal, opts, initial_poses=poses)
 
     def test_disabled_at_zero(self, five_frames):
-        # When post_reproj_error_px=0, result should be identical across two runs
+        # When post_reproj_reject_pct=0, result should be identical across two runs
         # (no second pass, no randomness).
-        r1 = self._run(five_frames, post_reproj=0.0)
-        r2 = self._run(five_frames, post_reproj=0.0)
+        r1 = self._run(five_frames, post_reproj_pct=0.0)
+        r2 = self._run(five_frames, post_reproj_pct=0.0)
         assert r1["n_tracks"] == r2["n_tracks"]
 
-    def test_tight_threshold_reduces_tracks(self, five_frames):
-        r_loose = self._run(five_frames, post_reproj=50.0)  # keeps almost everything
-        r_tight = self._run(five_frames, post_reproj=1.0)   # strict
+    def test_higher_pct_keeps_fewer_tracks(self, five_frames):
+        r_loose = self._run(five_frames, post_reproj_pct=0.05)  # reject 5%
+        r_tight = self._run(five_frames, post_reproj_pct=0.5)   # reject 50%
         assert r_tight["n_tracks"] <= r_loose["n_tracks"], (
-            f"tight threshold should keep <= tracks: got {r_tight['n_tracks']} vs {r_loose['n_tracks']}"
+            f"50% rejection should keep ≤ tracks than 5%: "
+            f"got {r_tight['n_tracks']} vs {r_loose['n_tracks']}"
         )
 
-    def test_returned_tracks_pass_their_own_threshold(self, five_frames):
-        # After post-opt rejection, every surviving track should have max reproj ≤ threshold
-        # when measured against the returned optimised poses.
-        threshold = 2.0
-        img_list, poses, cal = five_frames
-        opts = SfmOptions(
-            sift_features=500, min_parallax_deg=1.0,
-            classify_pairs=False, match_window=3,
-            min_track_length=2, post_reproj_error_px=threshold,
-        )
-        result = optimize_poses(img_list, cal, opts, initial_poses=poses)
+    def test_single_iteration_removes_correct_fraction(self, five_frames):
+        # With one iteration and 30% rejection, track count should drop by ~30%.
+        r_full = self._run(five_frames, post_reproj_pct=0.0)
+        r_trimmed = self._run(five_frames, post_reproj_pct=0.3, post_reproj_iters=1)
 
-        # Re-run filter_by_reproj on the returned tracks with returned poses
-        still_good = filter_by_reproj(
-            result["triangulated"],
-            result["keypoints"],
-            result["poses"],
-            cal,
-            threshold,
-        )
-        assert len(still_good) == len(result["triangulated"]), (
-            f"Expected all {len(result['triangulated'])} returned tracks to pass "
-            f"the {threshold}px threshold, but {len(result['triangulated']) - len(still_good)} do not"
+        n_full = r_full["n_tracks"]
+        n_after = r_trimmed["n_tracks"]
+        n_expected_rejected = int(n_full * 0.3)
+        n_expected_remaining = n_full - n_expected_rejected
+
+        # Allow ±2 tracks for rounding and degenerate-landmark retries in _build_and_optimize.
+        assert abs(n_after - n_expected_remaining) <= 2, (
+            f"30% rejection (1 iter) from {n_full} tracks: "
+            f"expected ≈{n_expected_remaining}, got {n_after}"
         )
 
     def test_poses_are_valid_after_reoptimisation(self, five_frames):
-        result = self._run(five_frames, post_reproj=2.0)
-        # All 5 cameras should be in the result with finite translations
+        result = self._run(five_frames, post_reproj_pct=0.1)
+        # All 5 cameras should be in the result with finite translations.
         assert len(result["poses"]) == 5
         for img_id, pose in result["poses"].items():
             t = pose.translation()
@@ -146,15 +140,15 @@ class TestPostReprojImprovesPoseAccuracy:
             classify_pairs=True, match_window=3, min_track_length=3,
         )
 
-        r_no_post  = optimize_poses(img_list, cal,
-                                    SfmOptions(**base_opts, post_reproj_error_px=0.0),
-                                    initial_poses=noisy_poses)
+        r_no_post   = optimize_poses(img_list, cal,
+                                     SfmOptions(**base_opts, post_reproj_reject_pct=0.0),
+                                     initial_poses=noisy_poses)
         r_with_post = optimize_poses(img_list, cal,
-                                     SfmOptions(**base_opts, post_reproj_error_px=2.0),
+                                     SfmOptions(**base_opts, post_reproj_reject_pct=0.1),
                                      initial_poses=noisy_poses)
 
         shared = set(gt_poses) & set(r_no_post["poses"]) & set(r_with_post["poses"])
-        gt_shared   = {k: gt_poses[k] for k in shared}
+        gt_shared    = {k: gt_poses[k] for k in shared}
         ape_no_post  = self._ape_mean(gt_shared, {k: r_no_post["poses"][k]  for k in shared})
         ape_with_post = self._ape_mean(gt_shared, {k: r_with_post["poses"][k] for k in shared})
 

@@ -7,7 +7,7 @@ Run each level with:
 ```
 pixi run eth3d-exhibition-hall-noise-easy-sfm
 pixi run eth3d-exhibition-hall-noise-medium-sfm
-pixi run eth3d-exhibition-hall-noisy-sfm        # hard
+pixi run eth3d-exhibition-hall-noise-hard-sfm
 ```
 
 ---
@@ -90,7 +90,7 @@ Cheirality failures: concentrated on pairs 61-62, 63-64 (near-duplicate frames n
 
 ### Hard — σ_t=100mm, σ_R=0.05rad
 
-Pixi task: `eth3d-exhibition-hall-noisy-sfm`
+Pixi task: `eth3d-exhibition-hall-noise-hard-sfm`  (preset: `hard`)
 Last run: 2026-05-14
 
 ```
@@ -99,6 +99,8 @@ APE — initial:    mean=0.1472m  median=0.1431m  max=0.2929m  rmse=0.1594m
 APE — optimised:  mean=0.1880m  median=0.1608m  max=0.5409m  rmse=0.2202m
                   mean=3.2758°  median=2.6315°  max=15.3883° rmse=4.0332°
 Pair classification: 0 dropped (σ_t=100mm >> 0.2mm true baseline; pose classifier blind)
+H/E secondary check: disabled — removing near-duplicate pairs isolates camera 61 (worse)
+Track stats: 662 tracks  length: mean=3.2  median=3  max=6
 ```
 
 | Criterion | Status | Detail |
