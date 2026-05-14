@@ -109,12 +109,14 @@ _DEFAULTS: dict = {
     "min_parallax_deg": 1.0,
     "huber_loss":       False,
     "ransac_threshold":  2.0,
-    "min_track_length":       3,
-    "match_window":           3,
-    "post_reproj_reject_pct": 0.0,
-    "post_reproj_iters":      4,
-    "he_secondary_check":     True,
-    "ignore_poses":        False,
+    "min_track_length":         3,
+    "match_window":             3,
+    "degenerate_extra_window":  3,
+    "pure_rotation_reprojection": True,
+    "post_reproj_reject_pct":   0.0,
+    "post_reproj_iters":        4,
+    "he_secondary_check":       True,
+    "ignore_poses":             False,
 }
 
 # Preset parameter overrides. Keys match the _DEFAULTS keys above.
@@ -253,6 +255,14 @@ def main() -> None:
                         help="Disable H/E ratio secondary check. By default, pairs that pass the "
                              "pose classifier are also checked image-based to catch near-duplicates "
                              "under high pose noise.")
+    parser.add_argument("--degenerate-extra-window", type=int, default=None,
+                        help="Extra match window for cameras in degenerate clusters (PURE_ROTATION "
+                             "pairs). Those cameras try offsets match_window+1 … match_window+N to "
+                             "reach landmarks from non-cluster cameras. Default 3.")
+    parser.add_argument("--no-pure-rotation-reprojection", action="store_false",
+                        dest="pure_rotation_reprojection", default=None,
+                        help="Disable reprojection-only factors for PURE_ROTATION cluster cameras. "
+                             "Use when pose noise exceeds the landmark accuracy benefit.")
     args = parser.parse_args()
 
     # Apply preset first, then explicit CLI flags override, then fall back to _DEFAULTS.
@@ -274,10 +284,12 @@ def main() -> None:
         "huber_loss":       args.huber_loss if args.huber_loss else None,
         "ransac_threshold":     args.ransac_threshold,
         "min_track_length":       args.min_track_length,
-        "match_window":           args.match_window,
-        "post_reproj_reject_pct": args.post_reproj_pct,
-        "post_reproj_iters":      args.post_reproj_iters,
-        "he_secondary_check":     args.he_secondary_check,
+        "match_window":             args.match_window,
+        "degenerate_extra_window":  args.degenerate_extra_window,
+        "pure_rotation_reprojection": args.pure_rotation_reprojection,
+        "post_reproj_reject_pct":   args.post_reproj_pct,
+        "post_reproj_iters":        args.post_reproj_iters,
+        "he_secondary_check":       args.he_secondary_check,
         "ignore_poses":         True if args.ignore_poses else None,
     }
     for k, v in cli_overrides.items():
@@ -347,6 +359,8 @@ def main() -> None:
         ransac_threshold=effective["ransac_threshold"],
         min_track_length=effective["min_track_length"],
         match_window=effective["match_window"],
+        degenerate_extra_window=effective["degenerate_extra_window"],
+        pure_rotation_reprojection=effective["pure_rotation_reprojection"],
         post_reproj_reject_pct=effective["post_reproj_reject_pct"],
         post_reproj_iters=effective["post_reproj_iters"],
         he_secondary_check=effective["he_secondary_check"],

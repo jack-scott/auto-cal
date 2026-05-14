@@ -102,36 +102,27 @@ Location: `sfm_solver.py: optimize_poses`, after RANSAC filtering.
 
 ---
 
-### 4. PURE_ROTATION pair handling
+### 4. PURE_ROTATION pair handling — ✓ IMPLEMENTED
 
-Currently PURE_ROTATION pairs are silently dropped.  The correct behaviour is to
-reproject observations against *existing* landmarks (not triangulate new ones).
-This adds reprojection constraints for those cameras without requiring a baseline.
+PURE_ROTATION pairs no longer silently dropped.  The pipeline:
+1. Identifies PURE_ROTATION pairs via H/E ratio test or pose classifier.
+2. Applies cluster-interior demotion: all GOOD pairs where both endpoints are inside
+   the degenerate cluster are also demoted to PURE_ROTATION.
+3. Extends the match window for cluster cameras (`degenerate_extra_window` offsets
+   beyond `match_window`) so they can reach non-cluster landmarks.
+4. After triangulating GOOD pairs, builds `obs_to_track_idx` reverse lookup and
+   adds `extra_obs` (img_id, track_idx, kp_idx) for each PURE_ROTATION match that
+   hits an existing landmark.
+5. Passes `extra_obs` to `_build_and_optimize` as additional reprojection factors.
 
-This directly fixes the camera 61–64 isolation problem at hard noise: those
-cameras have no good translating pairs to anchor them, but they do share
-landmarks with adjacent cameras.
+The `filter_pairs_by_geometry` return signature was updated to a 4-tuple:
+`(good_pairs, pure_rotation_pairs, counts, n_he_override)`.
 
-```python
-if pair_class == PairClass.PURE_ROTATION:
-    # Use H-based filtering (E is ill-conditioned with no translation)
-    matches = filter_matches_homography(kp_a, kp_b, raw_matches)
-    for match in matches:
-        lm_id = find_existing_landmark(match, track_map)
-        if lm_id is not None:
-            graph.add(gtsam.GenericProjectionFactorCal3DS2(
-                gtsam.Point2(*observed_uv), obs_noise, X(frame_j), L(lm_id), cal
-            ))
-```
-
-This requires the landmark map to be built before processing PURE_ROTATION pairs,
-i.e. the pipeline must do one pass of triangulation first, then a second pass
-adding pure-rotation reprojection factors.  Forward-pass dependency: does not
-fit the current single-pass batch structure.
-
-For now, dropping PURE_ROTATION pairs is correct and safe.  The reprojection-only
-path is the next major architectural change once the pipeline moves toward
-incremental or multi-pass structure.
+**Limitation at hard noise (σ_t=100mm):** cluster camera poses are too noisy for
+their reprojection observations to help — they corrupt good landmarks and cause
+cascade removals.  H/E secondary check is kept disabled for the hard preset until
+§7 (noise-adaptive prior) or §8 (coarse-to-fine) is implemented.  The
+`--no-pure-rotation-reprojection` flag disables extra_obs building when needed.
 
 ---
 
@@ -315,7 +306,7 @@ Images + Pose Priors
 4. PAIR CLASSIFICATION                          ✓ COMPLETED
    classify_pair_with_poses (or H/E fallback)
    STATIC       → drop pair
-   PURE_ROTATION → keep for reprojection pass (step 7b)  ← §4 pending
+   PURE_ROTATION → keep for reprojection pass (step 7b)  ✓ COMPLETED
    GOOD / PURE_TRANSLATION → proceed
         │
         ▼
@@ -333,8 +324,8 @@ Images + Pose Priors
    Robust Huber loss throughout
    Dogleg optimiser
         │
-   7b. PURE_ROTATION reprojection factors       ← §4 pending
-       match via H, look up existing landmarks,
+   7b. PURE_ROTATION reprojection factors       ✓ COMPLETED
+       look up existing landmarks via obs_to_track_idx,
        add reprojection-only factors for those cameras
         │
         ▼
@@ -382,15 +373,27 @@ These are ordered by impact and dependency:
    Pre-opt reproj threshold needs tuning per noise level — 4px cuts all skip-frame tracks,
    0px lets noisy landmarks corrupt the optimizer.  Full benefit from post-opt rejection.
 
-5. **Iterative outlier rejection + noise-adaptive threshold** (§6) — next up.
+5. **PURE_ROTATION reprojection path** (§4) — ✓ IMPLEMENTED (net-neutral at hard level; pending §7/§8 to unlock benefit).
+   Two-pass structure: triangulate GOOD pairs first, then look up existing landmarks in
+   PURE_ROTATION pair matches and add reprojection-only factors for those cameras.
+   Cluster-interior demotion prevents triangulation from any pair where both endpoints are
+   in the degenerate cluster.  Extended matching window for cluster cameras adds reach to
+   non-cluster landmarks.
+   - `SfmOptions.degenerate_extra_window: int = 3`, `--degenerate-extra-window` CLI flag.
+   - `SfmOptions.pure_rotation_reprojection: bool = True`, `--no-pure-rotation-reprojection` CLI flag.
+   - Easy/medium: no regressions; cluster cameras correctly get reprojection constraints.
+   - Hard (σ_t=100mm): H/E secondary check kept disabled for now — noisy cluster camera
+     poses (100mm noise) make their reprojection observations inconsistent with good
+     landmarks, causing cascade landmark removal (69 removals) and worse APE (0.202m vs
+     0.188m baseline).  Benefit requires §7 noise-adaptive prior so the optimizer can
+     trade noisy prior for geometric constraint, or §8 coarse-to-fine to reach the correct
+     basin before adding loose constraints from cluster cameras.
+   Retaining infrastructure (correct pair demotion, extra_obs hookup) for when §7/§8 unlocks it.
+
+6. **Iterative outlier rejection + noise-adaptive threshold** (§6) — next up.
    Replace single-pass 5px with tightening schedule [20px, 10px, 5px, 3px], warm-starting
    each BA pass.  Add noise-adaptive start threshold (§6).
    Expected impact: medium noise improves from 7% to ≥10%; easy post-opt becomes useful.
-
-6. **PURE_ROTATION reprojection path** (§4) — high priority for hard level.
-   Requires two-pass structure: triangulate first, then add reprojection-only factors for
-   PURE_ROTATION pairs against existing landmarks.  Fixes camera 61–64 isolation.
-   Unblocks turning H/E secondary check back on at hard noise.
 
 7. **Noise-adaptive pose prior** (§7) — pair with §4.
    Once junk-landmark isolation is fixed via reprojection-only path, the prior noise can
@@ -415,10 +418,14 @@ These are ordered by impact and dependency:
 
 ## Open questions
 
-- **H/E secondary check at hard noise:** removing near-duplicate pairs at σ_t=100mm
-  isolates camera 61 (all its connections are either near-duplicates or rotation-dominated).
-  The correct fix is PURE_ROTATION reprojection-only factors (§4) so cameras in the
-  degenerate cluster still get observation constraints.  Until then, H/E disabled for hard.
+- **H/E secondary check at hard noise:** PURE_ROTATION reprojection path is implemented (§4).
+  However at σ_t=100mm, noisy cluster camera poses make their reprojection observations
+  inconsistent with good landmarks, causing 69+ landmark cascade removals and worse APE
+  (0.202m vs 0.188m baseline).  H/E remains disabled for the hard preset until §7/§8.
+  Once noise-adaptive prior (§7) allows the optimizer to discount the noisy prior in
+  favour of geometric constraints, or coarse-to-fine (§8) lands near the correct basin
+  first, the PURE_ROTATION reprojection observations from cluster cameras will become
+  net-positive rather than net-negative.
 
 - **Post-opt threshold tuning:** 5px cuts too many tracks at medium noise (180→9).
   Iterative tightening schedule (§6) replaces the fixed threshold; the noise-adaptive

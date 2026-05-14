@@ -80,7 +80,7 @@ class TestWithPoses:
         raw = match_sift(d["descs"][61_000_000_000], d["descs"][62_000_000_000])
         pairs = {(61_000_000_000, 62_000_000_000): raw}
 
-        filtered, counts, _ = filter_pairs_by_geometry(pairs, d["poses"])
+        filtered, _, counts, _ = filter_pairs_by_geometry(pairs, d["poses"])
 
         assert len(filtered) == 0
         assert counts[PairClass.STATIC] == 1
@@ -91,7 +91,7 @@ class TestWithPoses:
         raw = match_sift(d["descs"][0], d["descs"][1_000_000_000])
         pairs = {(0, 1_000_000_000): raw}
 
-        filtered, counts, _ = filter_pairs_by_geometry(pairs, d["poses"])
+        filtered, _, counts, _ = filter_pairs_by_geometry(pairs, d["poses"])
 
         assert (0, 1_000_000_000) in filtered
         assert counts[PairClass.GOOD] == 1
@@ -106,7 +106,7 @@ class TestWithPoses:
             (61_000_000_000, 62_000_000_000):      static_matches,
         }
 
-        filtered, counts, _ = filter_pairs_by_geometry(pairs, d["poses"])
+        filtered, _, counts, _ = filter_pairs_by_geometry(pairs, d["poses"])
 
         assert (0, 1_000_000_000) in filtered
         assert (61_000_000_000, 62_000_000_000) not in filtered
@@ -118,7 +118,7 @@ class TestWithPoses:
     def test_all_classes_present_in_counts(self, real_data):
         d = real_data
         pairs = {(0, 1_000_000_000): match_sift(d["descs"][0], d["descs"][1_000_000_000])}
-        _, counts, _ = filter_pairs_by_geometry(pairs, d["poses"])
+        _, _, counts, _ = filter_pairs_by_geometry(pairs, d["poses"])
         assert set(counts.keys()) == set(PairClass)
 
 
@@ -132,12 +132,13 @@ class TestWithoutPoses:
         raw = match_sift(d["descs"][61_000_000_000], d["descs"][62_000_000_000])
         pairs = {(61_000_000_000, 62_000_000_000): raw}
 
-        filtered, counts, _ = filter_pairs_by_geometry(
+        filtered, pure_rotation, counts, _ = filter_pairs_by_geometry(
             pairs, poses=None,
             keypoints_u=d["kps_u"], K=d["K"],
         )
 
         assert len(filtered) == 0
+        assert (61_000_000_000, 62_000_000_000) in pure_rotation
         assert counts[PairClass.PURE_ROTATION] == 1
 
     def test_normal_pair_is_kept(self, real_data):
@@ -145,7 +146,7 @@ class TestWithoutPoses:
         raw = match_sift(d["descs"][0], d["descs"][1_000_000_000])
         pairs = {(0, 1_000_000_000): raw}
 
-        filtered, counts, _ = filter_pairs_by_geometry(
+        filtered, _, counts, _ = filter_pairs_by_geometry(
             pairs, poses=None,
             keypoints_u=d["kps_u"], K=d["K"],
         )
@@ -159,8 +160,9 @@ class TestWithoutPoses:
 # ---------------------------------------------------------------------------
 
 def test_empty_input_returns_empty(real_data):
-    filtered, counts, n_he = filter_pairs_by_geometry({}, real_data["poses"])
+    filtered, pure_rotation, counts, n_he = filter_pairs_by_geometry({}, real_data["poses"])
     assert filtered == {}
+    assert pure_rotation == {}
     assert sum(counts.values()) == 0
     assert n_he == 0
 
@@ -202,7 +204,7 @@ class TestHeSecondaryCheck:
         }
 
         # Confirm the pose classifier is fooled (no secondary check)
-        filtered_no_he, _, _ = filter_pairs_by_geometry(
+        filtered_no_he, _, _, _ = filter_pairs_by_geometry(
             pairs, noisy_poses, keypoints_u=d["kps_u"], K=d["K"],
             he_secondary_check=False,
         )
@@ -211,11 +213,12 @@ class TestHeSecondaryCheck:
         )
 
         # Secondary check must catch it
-        filtered_he, _, n_he = filter_pairs_by_geometry(
+        filtered_he, pure_rotation_he, _, n_he = filter_pairs_by_geometry(
             pairs, noisy_poses, keypoints_u=d["kps_u"], K=d["K"],
             he_secondary_check=True,
         )
         assert len(filtered_he) == 0, "H/E secondary check should drop the near-duplicate pair"
+        assert (61_000_000_000, 62_000_000_000) in pure_rotation_he
         assert n_he == 1
 
     def test_secondary_check_disabled_keeps_noisy_pair(self, real_data):
@@ -230,7 +233,7 @@ class TestHeSecondaryCheck:
             62_000_000_000: self._shifted_pose(real_61, dx_m=0.1),
         }
 
-        filtered, _, n_he = filter_pairs_by_geometry(
+        filtered, _, _, n_he = filter_pairs_by_geometry(
             pairs, noisy_poses, keypoints_u=d["kps_u"], K=d["K"],
             he_secondary_check=False,
         )
@@ -243,7 +246,7 @@ class TestHeSecondaryCheck:
         raw = match_sift(d["descs"][0], d["descs"][1_000_000_000])
         pairs = {(0, 1_000_000_000): raw}
 
-        filtered, _, n_he = filter_pairs_by_geometry(
+        filtered, _, _, n_he = filter_pairs_by_geometry(
             pairs, d["poses"], keypoints_u=d["kps_u"], K=d["K"],
             he_secondary_check=True,
         )
