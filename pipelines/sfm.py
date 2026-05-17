@@ -113,8 +113,10 @@ _DEFAULTS: dict = {
     "match_window":             3,
     "degenerate_extra_window":  3,
     "pure_rotation_reprojection": True,
-    "post_reproj_reject_pct":   0.0,
+    "post_reproj_start_px":    -1.0,
+    "post_reproj_min_px":       3.0,
     "post_reproj_iters":        4,
+    "retriangulate":            True,
     "he_secondary_check":       True,
     "ignore_poses":             False,
 }
@@ -124,23 +126,23 @@ _DEFAULTS: dict = {
 PRESETS: dict[str, dict] = {
     "fine": {
         # Tight priors, strict reprojection filter — use when initial poses are accurate (< 5 cm).
-        "pose_noise_m":     0.05,
-        "pose_noise_rad":   0.005,
-        "reproj_filter_px": 4.0,
-        "pixel_noise_px":   1.0,
-        "min_parallax_deg": 2.0,
-        "huber_loss":       False,
+        "pose_noise_m":        0.05,
+        "pose_noise_rad":      0.005,
+        "reproj_filter_px":    4.0,
+        "pixel_noise_px":      1.0,
+        "min_parallax_deg":    2.0,
+        "huber_loss":          False,
     },
     "medium": {
         # Moderate priors — use when initial poses have ~10-20 cm of noise.
         # Lenient reprojection filter so noisy triangulations aren't all discarded.
-        "pose_noise_m":     0.2,
-        "pose_noise_rad":   0.05,
-        "reproj_filter_px": 20.0,
-        "pixel_noise_px":   1.5,
-        "min_parallax_deg": 1.0,
-        "huber_loss":       True,
-        "max_tracks":       2000,
+        "pose_noise_m":        0.2,
+        "pose_noise_rad":      0.05,
+        "reproj_filter_px":    20.0,
+        "pixel_noise_px":      1.5,
+        "min_parallax_deg":    1.0,
+        "huber_loss":          True,
+        "max_tracks":          2000,
     },
     "hard": {
         # Large pose noise (σ_t ≈ 5–15 cm, σ_R ≈ 2–5°).  Translation prior
@@ -244,12 +246,20 @@ def main() -> None:
     parser.add_argument("--match-window", type=int, default=None,
                         help="Match each frame against this many following frames (default 3). "
                              "1 = sequential only.")
-    parser.add_argument("--post-reproj-pct", type=float, default=None,
-                        help="After optimisation, iteratively reject the worst fraction of tracks "
-                             "by reprojection error and re-optimise. E.g. 0.1 rejects the worst "
-                             "10%% each iteration. 0=disabled (default).")
+    parser.add_argument("--post-reproj-start-px", type=float, default=None,
+                        help="Starting reprojection threshold for post-opt tightening. "
+                             "0 = auto-compute from pose noise and scene depth (recommended). "
+                             "-1 = disabled (default). Threshold decays geometrically to "
+                             "--post-reproj-min-px over --post-reproj-iters passes.")
+    parser.add_argument("--post-reproj-min-px", type=float, default=None,
+                        help="Final minimum reprojection threshold for tightening (default 3.0px).")
     parser.add_argument("--post-reproj-iters", type=int, default=None,
-                        help="Number of iterative post-optimisation rejection rounds (default 4).")
+                        help="Number of post-optimisation tightening passes (default 4).")
+    parser.add_argument("--no-retriangulate", action="store_false", dest="retriangulate",
+                        default=None,
+                        help="Disable retriangulation after tightening. By default, all good-pair "
+                             "tracks are re-triangulated with improved poses and non-overlapping "
+                             "clean tracks are added to the graph.")
     parser.add_argument("--no-he-secondary-check", action="store_false", dest="he_secondary_check",
                         default=None,
                         help="Disable H/E ratio secondary check. By default, pairs that pass the "
@@ -287,8 +297,10 @@ def main() -> None:
         "match_window":             args.match_window,
         "degenerate_extra_window":  args.degenerate_extra_window,
         "pure_rotation_reprojection": args.pure_rotation_reprojection,
-        "post_reproj_reject_pct":   args.post_reproj_pct,
+        "post_reproj_start_px":     args.post_reproj_start_px,
+        "post_reproj_min_px":       args.post_reproj_min_px,
         "post_reproj_iters":        args.post_reproj_iters,
+        "retriangulate":            args.retriangulate,
         "he_secondary_check":       args.he_secondary_check,
         "ignore_poses":         True if args.ignore_poses else None,
     }
@@ -361,8 +373,10 @@ def main() -> None:
         match_window=effective["match_window"],
         degenerate_extra_window=effective["degenerate_extra_window"],
         pure_rotation_reprojection=effective["pure_rotation_reprojection"],
-        post_reproj_reject_pct=effective["post_reproj_reject_pct"],
+        post_reproj_start_px=effective["post_reproj_start_px"],
+        post_reproj_min_px=effective["post_reproj_min_px"],
         post_reproj_iters=effective["post_reproj_iters"],
+        retriangulate=effective["retriangulate"],
         he_secondary_check=effective["he_secondary_check"],
     )
 

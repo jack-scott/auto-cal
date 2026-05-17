@@ -38,7 +38,7 @@ pixi run eth3d-exhibition-hall-noise-hard-sfm
 ### Easy — σ_t=5mm, σ_R=0.002rad
 
 Pixi task: `eth3d-exhibition-hall-noise-easy-sfm`
-Last run: 2026-05-14
+Last run: 2026-05-15
 
 ```
 APE — initial:    mean=0.0074m  median=0.0072m  max=0.0146m  rmse=0.0080m
@@ -47,8 +47,8 @@ APE — optimised:  mean=0.0067m  median=0.0066m  max=0.0166m  rmse=0.0074m
                   mean=0.0879°  median=0.0733°  max=0.2647°  rmse=0.1021°
 Pair classification: dropped 2 STATIC + 1 PURE_ROTATION (via H/E), 191 GOOD pairs remain
 Extended matching: +6 GOOD pairs for 2 cluster cameras
-Track length filter (≥3): applied; top-2000 tracks selected
-Post-opt: disabled (--post-reproj-px 0) — 5px threshold was too tight, cut 420→168 and worsened APE
+Track length filter (≥3): applied; top-420 tracks selected
+Post-opt: disabled (--post-reproj-pct 0)
 ```
 
 | Criterion | Status | Detail |
@@ -60,14 +60,22 @@ Post-opt: disabled (--post-reproj-px 0) — 5px threshold was too tight, cut 420
 
 Note: reproj pre-filter set to 8px — at 5mm noise over 3 frames and 3408px focal length,
 skip-frame pairs accumulate ~10px reprojection error with initial poses, so 4px cuts all
-window-matched tracks. Full benefit from post-opt rejection requires noise-adaptive threshold.
+window-matched tracks.
+
+**Post-opt experiments (2026-05-15 → 2026-05-17):**
+- Percentage rejection (`--post-reproj-pct 0.1`, 4 iters): 420→277 tracks, 6.7→6.9mm. Worse.
+- Noise-adaptive tightening (start=auto ~10px, min=3px, 4 iters): 420→182 tracks, 6.7→6.9mm. Worse.
+- Retriangulate-first at 10px, then tighten: 420→182 tracks, ~6.9mm. No improvement.
+Root cause: at 5mm noise, the initial BA already finds the optimum with 420 tracks. Post-opt
+removes valid tracks (they're all at the noise floor, not outliers). **Post-opt disabled for
+fine preset.**
 
 ---
 
 ### Medium — σ_t=20mm, σ_R=0.01rad
 
 Pixi task: `eth3d-exhibition-hall-noise-medium-sfm`
-Last run: 2026-05-14
+Last run: 2026-05-15
 
 ```
 APE — initial:    mean=0.0294m  median=0.0286m  max=0.0586m  rmse=0.0319m
@@ -77,7 +85,7 @@ APE — optimised:  mean=0.0273m  median=0.0266m  max=0.0585m  rmse=0.0297m
 Pair classification: 3 PURE_ROTATION via H/E check; 8 intra-cluster GOOD pairs demoted; 191 GOOD remain
 Extended matching: +12 GOOD pairs for 6 cluster cameras; PURE_ROTATION reprojection: 43+ extra obs
 Track length filter (≥3): applied
-Post-opt: disabled (--post-reproj-px 0) — 5px threshold cut 180→9 tracks, zero improvement
+Post-opt: disabled (--post-reproj-pct 0)
 ```
 
 | Criterion | Status | Detail |
@@ -87,12 +95,23 @@ Post-opt: disabled (--post-reproj-px 0) — 5px threshold cut 180→9 tracks, ze
 | 3. Degenerate pairs dropped | ✓ PASS | 3 PURE_ROTATION via H/E check; 8 intra-cluster demoted |
 | 4. No cheirality from 61-64 | ✓ PASS | Cluster pairs demoted to PURE_ROTATION; no triangulation |
 
+**Post-opt experiments (2026-05-15 → 2026-05-17):**
+- Percentage rejection (10%, 4 iters): 180→119 tracks, 27.3→28.2mm. Worse.
+- Noise-adaptive tightening (start=auto ~30px, min=3px, 4 iters): 180→7 tracks → 24 after retriangulation, 29.2mm. Much worse.
+- Tighten to min=8px: 180→38 tracks → 98 after retriangulation, 27.8mm. Still worse.
+- Retriangulate-first at 30px (add 192 new → 372), then tighten to 8px: 372→15 tracks, catastrophic.
+Root cause: at 20mm noise, expected reproj error ≈ 13.6px for ALL tracks — there is no
+reproj-based distinction between good and bad tracks at this noise level. Removing any tracks
+removes valid constraints. The initial BA at 180 tracks is already the best achievable with
+the current approach. **Post-opt disabled for medium preset.** Path to criterion 2 requires
+§7 noise-adaptive prior or more/better tracks from pair classification.
+
 ---
 
 ### Hard — σ_t=100mm, σ_R=0.05rad
 
 Pixi task: `eth3d-exhibition-hall-noise-hard-sfm`  (preset: `hard`)
-Last run: 2026-05-14
+Last run: 2026-05-15
 
 ```
 APE — initial:    mean=0.1472m  median=0.1431m  max=0.2929m  rmse=0.1594m
@@ -135,14 +154,15 @@ the noisy initial poses.  Fix requires §7/§8 (see `pipeline_plan.md`).
 pose classifier (or always). Will catch static pairs regardless of pose noise.
 See `pipeline_plan.md` open questions.
 
-### To unlock post-optimisation outlier rejection
+### Post-opt status (as of 2026-05-17)
 
-Post-opt is implemented (`SfmOptions.post_reproj_error_px`) but disabled in all pixi
-tasks (`--post-reproj-px 0`). The 5px fixed threshold is too tight:
-- Easy: cuts 420→168 tracks, worsens APE from 6.7mm to 7.0mm
-- Medium: cuts 180→9 tracks, zeroes out all improvement
+Noise-adaptive tightening + retriangulation is implemented in `SfmOptions` and tested
+(6 unit tests pass). However it is **disabled in fine and medium presets** because:
+- At all tested noise levels, the initial BA with all available tracks already finds the
+  best achievable result. Post-opt either removes valid geometry (tightening) or adds
+  noise (retriangulation with failed tracks).
+- Root cause: reproj error at the noise floor is indistinguishable from outlier reproj error
+  unless pose accuracy is already within ~1px residual.
 
-Options:
-1. Express threshold as `N × σ_pixel` (noise-adaptive)
-2. Use a percentile filter (reject worst 10% of tracks by max reproj)
-3. Run multiple iterations and tighten threshold each pass
+Post-opt may become useful after §7 (noise-adaptive prior) or §8 (coarse-to-fine init)
+reduces pose error enough that true outliers stand above the noise floor.

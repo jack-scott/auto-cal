@@ -43,7 +43,6 @@ from autocal.engine.features import (
     filter_by_reproj,
     filter_matches_ransac,
     match_sift,
-    max_reproj_error,
     triangulate_gtsam,
     undistort_keypoints,
 )
@@ -78,8 +77,42 @@ class SfmOptions:
     match_window: int = 3
     degenerate_extra_window: int = 3
     pure_rotation_reprojection: bool = True
-    post_reproj_reject_pct: float = 0.0
+    post_reproj_start_px: float = -1.0   # 0 = auto-compute from pose_noise_m; -1 = disabled
+    post_reproj_min_px: float = 3.0
     post_reproj_iters: int = 4
+    retriangulate: bool = True
+
+
+def _noise_adaptive_start_px(
+    pose_noise_m: float,
+    calibration: gtsam.Cal3DS2 | gtsam.Cal3Fisheye,
+    triangulated: list,
+    poses: dict,
+    post_reproj_min_px: float,
+) -> float:
+    """Compute a noise-adaptive starting reprojection threshold for post-opt tightening.
+
+    Estimates expected reprojection error from pose noise, focal length, and median
+    landmark depth.  Returns -1.0 if computation is not possible.
+    """
+    if pose_noise_m <= 0:
+        return -1.0
+    focal_px = max(calibration.fx(), calibration.fy())
+    depths = []
+    for t in triangulated:
+        if t.point3d is None:
+            continue
+        for img_id in t.observations:
+            if img_id in poses:
+                d = float(np.linalg.norm(t.point3d - poses[img_id].translation()))
+                if d > 0:
+                    depths.append(d)
+                break
+    if not depths:
+        return -1.0
+    median_depth = float(np.median(depths))
+    expected_px = pose_noise_m / median_depth * focal_px
+    return max(post_reproj_min_px * 2, 3.0 * expected_px)
 
 
 def optimize_poses(
@@ -301,6 +334,7 @@ def optimize_poses(
     # ------------------------------------------------------------------ #
     # Triangulate — GTSAM multi-view with nonlinear refinement
     # ------------------------------------------------------------------ #
+    good_matches_for_retriang = dict(matches_per_pair)  # snapshot for retriangulation
     tracks = build_tracks(matches_per_pair)
     if opts.min_track_length > 2:
         n_before = len(tracks)
@@ -410,59 +444,147 @@ def optimize_poses(
     }
 
     # ------------------------------------------------------------------ #
-    # Post-optimisation iterative outlier rejection + re-optimise
-    # Each iteration rejects the worst post_reproj_reject_pct fraction of
-    # tracks by max reprojection error, then warm-starts the next BA pass.
-    # Percentage-based rejection scales with the noise level automatically.
+    # Noise-adaptive post-optimisation: retriangulate first, then tighten
+    #
+    # Step 1 — Retriangulation: rebuild all candidate tracks from the
+    # original good-pair matches using the improved poses from the initial
+    # BA.  Filter at start_px (wide, noise-adaptive threshold) and add
+    # non-overlapping tracks to the current set.  A combined BA gives
+    # better poses from more constraints.
+    #
+    # Step 2 — Optional tightening: geometrically decay the reprojection
+    # threshold from start_px to post_reproj_min_px over post_reproj_iters
+    # passes.  Each pass removes tracks above the threshold and re-runs BA
+    # warm-started from the previous result.  Starting after retriangulation
+    # means poses are already improved; the tightening removes true outliers
+    # rather than valid-but-noisy tracks.
     # ------------------------------------------------------------------ #
-    if opts.post_reproj_reject_pct > 0:
+    start_px = opts.post_reproj_start_px
+    if start_px == 0.0:
+        start_px = _noise_adaptive_start_px(
+            opts.pose_noise_m, calibration, triangulated, opt_poses,
+            opts.post_reproj_min_px,
+        )
+
+    if start_px > 0:
         current_tracks = triangulated
-        current_poses = opt_poses
-        for iteration in range(opts.post_reproj_iters):
-            if not current_tracks:
-                break
-            errors = [
-                max_reproj_error(t, keypoints, current_poses, calibration)
-                for t in current_tracks
+        current_poses  = opt_poses
+
+        # Step 1: Retriangulate at start_px (wide threshold) to add tracks
+        if opts.retriangulate:
+            retri_tracks = build_tracks(good_matches_for_retriang)
+            retri_tracks = [t for t in retri_tracks
+                            if len(t.observations) >= opts.min_track_length]
+            triangulate_gtsam(
+                retri_tracks, keypoints, calibration, current_poses,
+                max_dist=opts.max_landmark_dist_m,
+                min_parallax_deg=opts.min_parallax_deg,
+            )
+            retri_valid = [
+                t for t in retri_tracks
+                if t.point3d is not None
+                and all_positive_depth(t.point3d, t.observations, current_poses)
             ]
-            n_reject = max(1, int(len(current_tracks) * opts.post_reproj_reject_pct))
-            if n_reject >= len(current_tracks):
-                break
-            order = sorted(range(len(errors)), key=lambda j: errors[j], reverse=True)
-            reject_set = set(order[:n_reject])
-            clean = [t for j, t in enumerate(current_tracks) if j not in reject_set]
-            worst_rejected = errors[order[0]]
-            worst_kept     = errors[order[n_reject]]
-            print(
-                f"  Post-opt iter {iteration + 1}/{opts.post_reproj_iters}: "
-                f"rejected {n_reject} worst tracks "
-                f"({opts.post_reproj_reject_pct:.0%}, "
-                f"max reproj {worst_rejected:.1f}px → kept ≤{worst_kept:.1f}px), "
-                f"re-optimising on {len(clean)}...",
-                flush=True,
+            retri_valid = filter_by_reproj(
+                retri_valid, keypoints, current_poses, calibration, start_px
             )
-            try:
-                result, graph, initial_values, _ = _build_and_optimize(
-                    clean, current_poses, id_to_idx, img_ids, keypoints,
-                    calibration, opts, has_priors,
-                    initial_poses if has_priors else None,
-                    _fisheye,
-                    extra_obs=extra_obs,
-                )
-            except RuntimeError as exc:
-                print(f"  Post-opt iter {iteration + 1} failed ({exc}), stopping early.",
-                      flush=True)
-                break
-            print(
-                f"    Error: {graph.error(initial_values):.3e} → {graph.error(result):.3e}",
-                flush=True,
-            )
-            current_poses = {
-                img_id: result.atPose3(X(idx))
-                for img_id, idx in id_to_idx.items()
+            existing_obs: set[tuple] = {
+                (img_id, kp_idx)
+                for t in current_tracks
+                for img_id, kp_idx in t.observations.items()
             }
-            current_tracks = clean
-        opt_poses = current_poses
+            new_tracks = [
+                t for t in retri_valid
+                if not any(
+                    (img_id, kp_idx) in existing_obs
+                    for img_id, kp_idx in t.observations.items()
+                )
+            ]
+            print(
+                f"  Retriangulation: {len(new_tracks)} new tracks "
+                f"({len(retri_valid)} clean of {len(retri_tracks)} candidates, "
+                f"{start_px:.1f}px threshold)",
+                flush=True,
+            )
+            if new_tracks:
+                combined = current_tracks + new_tracks
+                combined.sort(key=lambda t: len(t.observations), reverse=True)
+                combined = combined[: opts.max_tracks]
+                try:
+                    result, graph, initial_values, _ = _build_and_optimize(
+                        combined, current_poses, id_to_idx, img_ids, keypoints,
+                        calibration, opts, has_priors,
+                        initial_poses if has_priors else None,
+                        _fisheye,
+                        extra_obs=extra_obs,
+                    )
+                    print(
+                        f"    Error: {graph.error(initial_values):.3e} → "
+                        f"{graph.error(result):.3e}",
+                        flush=True,
+                    )
+                    current_poses = {
+                        img_id: result.atPose3(X(idx))
+                        for img_id, idx in id_to_idx.items()
+                    }
+                    current_tracks = combined
+                except RuntimeError as exc:
+                    print(f"  Retriangulation BA failed ({exc}), keeping original set.",
+                          flush=True)
+
+        # Step 2: Iterative tightening from start_px down to post_reproj_min_px
+        if start_px > opts.post_reproj_min_px and opts.post_reproj_iters > 0:
+            if opts.post_reproj_iters <= 1:
+                decay = 1.0
+            else:
+                decay = (start_px / opts.post_reproj_min_px) ** (
+                    1.0 / (opts.post_reproj_iters - 1)
+                )
+            threshold = start_px
+
+            for iteration in range(opts.post_reproj_iters):
+                if not current_tracks:
+                    break
+                clean = filter_by_reproj(
+                    current_tracks, keypoints, current_poses, calibration, threshold
+                )
+                n_rejected = len(current_tracks) - len(clean)
+                if n_rejected > 0 and clean:
+                    print(
+                        f"  Post-opt iter {iteration + 1}/{opts.post_reproj_iters}: "
+                        f"{threshold:.1f}px threshold, rejected {n_rejected}, "
+                        f"re-optimising on {len(clean)}...",
+                        flush=True,
+                    )
+                    try:
+                        result, graph, initial_values, _ = _build_and_optimize(
+                            clean, current_poses, id_to_idx, img_ids, keypoints,
+                            calibration, opts, has_priors,
+                            initial_poses if has_priors else None,
+                            _fisheye,
+                            extra_obs=extra_obs,
+                        )
+                        print(
+                            f"    Error: {graph.error(initial_values):.3e} → "
+                            f"{graph.error(result):.3e}",
+                            flush=True,
+                        )
+                        current_poses = {
+                            img_id: result.atPose3(X(idx))
+                            for img_id, idx in id_to_idx.items()
+                        }
+                        current_tracks = clean
+                    except RuntimeError as exc:
+                        print(
+                            f"  Post-opt iter {iteration + 1} failed ({exc}), stopping early.",
+                            flush=True,
+                        )
+                        break
+                threshold = max(opts.post_reproj_min_px, threshold / decay)
+                if threshold <= opts.post_reproj_min_px and n_rejected == 0:
+                    break
+
+        opt_poses    = current_poses
         triangulated = current_tracks
 
     track_lengths = [len(t.observations) for t in triangulated]
